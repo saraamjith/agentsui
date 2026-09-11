@@ -1,3 +1,5 @@
+<img width="1512" height="697" alt="image" src="https://github.com/user-attachments/assets/51c2e19f-28da-4c59-997c-086e9d1cfed5" />
+
 # AgentsUI
 
 A local command center for every Claude Code and Codex session on this machine.
