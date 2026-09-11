@@ -505,12 +505,12 @@ def process_cwds(pids):
 
 
 class Prefs:
-    """Small on-disk preference file. Holds the hidden-session list."""
+    """Small on-disk preference file. Holds the hidden-session list and custom titles."""
 
     def __init__(self, path):
         self.path = path
         self.lock = threading.Lock()
-        self.data = {"hidden": [], "layout": {}}
+        self.data = {"hidden": [], "layout": {}, "titles": {}}
         for source in (path, LEGACY_PREFS):      # carry the pre-rename file forward
             try:
                 self.data.update(json.loads(source.read_text()))
@@ -529,6 +529,22 @@ class Prefs:
             self.data["hidden"] = sorted(current)
             self._flush()
         return sorted(current)
+
+    @property
+    def titles(self):
+        return dict(self.data.get("titles", {}))
+
+    def rename(self, sid, title):
+        """A custom card title; an empty title goes back to the transcript's own."""
+        with self.lock:
+            titles = self.data.setdefault("titles", {})
+            title = " ".join(str(title or "").split())[:120]
+            if title:
+                titles[sid] = title
+            else:
+                titles.pop(sid, None)
+            self._flush()
+        return title
 
     @property
     def layout(self):
@@ -601,9 +617,13 @@ class Board:
             item["hosted"] = item["pid"] in ours
         rows.sort(key=lambda r: r["mtime"] or 0, reverse=True)
         hidden = PREFS_STORE.hidden
+        titles = PREFS_STORE.titles
         cutoff = time.time() - ACTIVE_WINDOW
         for row in rows:
             row["hidden"] = row["id"] in hidden
+            row["renamed"] = row["id"] in titles
+            if row["renamed"]:
+                row["title"] = titles[row["id"]]
             row["stale"] = (row["mtime"] or 0) < cutoff
         return {
             "now": time.time(),
@@ -765,6 +785,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, b'{"error":"no id"}', "application/json")
                 PREFS_STORE.hide(sid, bool(body.get("hidden", True)))
                 return self._send(200, b'{"ok":true}', "application/json")
+            if url.path == "/api/title":
+                sid = body.get("id")
+                if not sid:
+                    return self._send(400, b'{"error":"no id"}', "application/json")
+                title = PREFS_STORE.rename(sid, body.get("title", ""))
+                return self._send(200, json.dumps({"ok": True, "title": title}).encode(), "application/json")
             if url.path == "/api/layout":
                 sid = body.get("id")
                 if not sid:

@@ -19,7 +19,7 @@
         ? "Nothing active this week. The toolbar can show older or hidden sessions."
         : "No sessions yet. Start Claude Code or Codex in any directory and a card appears here.";
     }
-    if (html === boardSig) return;
+    if (html === boardSig || layer.querySelector(".name.editing")) return;   // never rip out a title mid-edit
     boardSig = html;
     layer.innerHTML = html;
   }
@@ -299,6 +299,7 @@
     const hide = ev.target.closest("[data-act='hide']");
     const card = ev.target.closest(".card");
     if (!card) return;
+    if (ev.target.closest(".name.editing")) return;   // clicks inside the editor stay there
     const id = card.dataset.id;
     if (hide) {
       ev.stopPropagation();
@@ -310,6 +311,41 @@
       return;
     }
     openPanel(id);
+  });
+  // ---- rename a card: double-click the title, Enter saves, Escape reverts ----
+  layer.addEventListener("dblclick", (ev) => {
+    const name = ev.target.closest(".name");
+    const card = ev.target.closest(".card");
+    if (!name || !card || name.classList.contains("editing")) return;
+    ev.preventDefault(); ev.stopPropagation();
+    const id = card.dataset.id, r = row(id);
+    const before = (r && r.title) || name.textContent;
+    name.textContent = before;
+    name.classList.add("editing");
+    name.contentEditable = "plaintext-only";
+    if (name.contentEditable !== "plaintext-only") name.contentEditable = "true";
+    name.focus();
+    try { const sel = getSelection(), range = document.createRange(); range.selectNodeContents(name); sel.removeAllRanges(); sel.addRange(range); } catch (e) { /* noop */ }
+    const finish = (save) => {
+      if (!name.classList.contains("editing")) return;
+      name.classList.remove("editing");
+      name.contentEditable = "false";
+      const next = save ? name.textContent.replace(/\s+/g, " ").trim() : before;
+      name.textContent = next || before;
+      if (save && next !== before) {
+        if (r) { r.title = next || r.title; r.renamed = !!next; }
+        post("/api/title", { id, title: next });
+        boardSig = null;
+        if (state) renderBoard(state);
+        renderTabs();
+      }
+    };
+    name.addEventListener("keydown", (ke) => {
+      if (ke.key === "Enter") { ke.preventDefault(); finish(true); }
+      else if (ke.key === "Escape") { ke.preventDefault(); ke.stopPropagation(); finish(false); }
+      ke.stopPropagation();
+    });
+    name.addEventListener("blur", () => finish(true), { once: true });
   });
   layer.addEventListener("keydown", (ev) => {
     const card = ev.target.closest(".card");

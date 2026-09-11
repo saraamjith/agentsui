@@ -117,6 +117,9 @@ button{font:inherit}
 .card.open .mark{color:var(--live); background:color-mix(in srgb, var(--live) 16%, #000)}
 .ident-text{min-width:0}
 .name{margin:0; font-size:17px; font-weight:600; line-height:1.25; letter-spacing:-.01em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.name{border-radius:4px; margin:0 -4px; padding:0 4px}
+.name:hover{background:var(--strip)}
+.name.editing{white-space:normal; overflow:visible; text-overflow:clip; background:var(--strip); outline:1px solid var(--hue); outline-offset:0; cursor:text}
 .sub{font-size:12px; color:var(--ink-dim); margin-top:2px}
 .agent-name{color:var(--ink-mid)}
 .on-tty{color:var(--warm)}

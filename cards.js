@@ -74,7 +74,7 @@
       '<button class="hide" data-act="hide" title="Hide this card" aria-label="Hide this card">&times;</button></div>' +
       '<div class="ident"><span class="mark mark-' + esc(s.agent || "claude") + '">' +
       (opts.open ? "&#9646;" : (s.agent === "codex" ? "&#11041;" : "&#10022;")) + "</span>" +
-      '<div class="ident-text"><h3 class="name">' + esc(trunc(s.title || s.lastPrompt || "untitled session", 60)) + "</h3>" +
+      '<div class="ident-text"><h3 class="name" data-act="rename" title="Double-click to rename">' + esc(trunc(s.title || s.lastPrompt || "untitled session", 60)) + "</h3>" +
       '<div class="sub"><span class="agent-name">' + esc(s.agent === "codex" ? "Codex" : "Claude Code") +
       "</span> &middot; " + esc(String(s.model || (s.agent === "codex" ? "codex" : "claude")).replace(/^claude-/, "")) +
       (opts.tty ? ' &middot; <span class="on-tty">' + esc(opts.tty) + "</span>" : "") +
