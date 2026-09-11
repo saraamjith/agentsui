@@ -329,6 +329,44 @@
     if (ev.target.closest("#dockClose")) closePanel();
   });
 
+  // ---- dock resize: drag the left edge; width persists across reloads -------
+  const DOCK_W_KEY = "agentsui.dockWidth", DOCK_MIN = 360, DOCK_MARGIN = 320;
+  (() => {
+    const grip = $("dockGrip");
+    if (!grip) return;
+    let startX = 0, startW = 0;
+    const clampW = (w) => Math.max(DOCK_MIN, Math.min(w, innerWidth - DOCK_MARGIN));
+    try {
+      const saved = parseInt(localStorage.getItem(DOCK_W_KEY), 10);
+      if (saved > 0) dock.style.setProperty("--dock-w", clampW(saved) + "px");
+    } catch (e) { /* storage unavailable */ }
+    grip.addEventListener("pointerdown", (ev) => {
+      if (ev.button !== 0 || !dock.classList.contains("open")) return;
+      startX = ev.clientX; startW = dock.getBoundingClientRect().width;
+      dock.classList.add("dragging");
+      grip.setPointerCapture(ev.pointerId);
+      ev.preventDefault();
+    });
+    grip.addEventListener("pointermove", (ev) => {
+      if (!dock.classList.contains("dragging")) return;
+      dock.style.setProperty("--dock-w", clampW(startW + (startX - ev.clientX)) + "px");
+    });
+    const end = (ev) => {
+      if (!dock.classList.contains("dragging")) return;
+      dock.classList.remove("dragging");
+      try { grip.releasePointerCapture(ev.pointerId); } catch (e) { /* already released */ }
+      try { localStorage.setItem(DOCK_W_KEY, String(Math.round(dock.getBoundingClientRect().width))); } catch (e) { /* noop */ }
+      AgentsTerms.refitAll();
+    };
+    grip.addEventListener("pointerup", end);
+    grip.addEventListener("pointercancel", end);
+    grip.addEventListener("dblclick", () => {
+      dock.style.removeProperty("--dock-w");
+      try { localStorage.removeItem(DOCK_W_KEY); } catch (e) { /* noop */ }
+      setTimeout(() => AgentsTerms.refitAll(), 220);
+    });
+  })();
+
   $("rail").addEventListener("click", (ev) => {
     const btn = ev.target.closest("[data-sess]");
     if (btn && btn.dataset.sess) openPanel(btn.dataset.sess, btn.dataset.hosted === "1" ? "term" : "log");

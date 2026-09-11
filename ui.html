@@ -10,7 +10,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{
-  --ground:#000; --bay:#0A0A0C; --strip:#121215; --strip-hi:#1A1A1F;
+  --ground:#000; --bay:#000; --strip:#121215; --strip-hi:#1A1A1F;
   --rule:#26262E; --rule-soft:#1C1C22;
   --ink:#F2F2F5; --ink-mid:#B9B9C6; --ink-dim:#80808E;
   --live:#CAFFBF; --warm:#FFD6A5; --cold:#8E8EA0; --alert:#FFADAD;
@@ -85,7 +85,7 @@ button{font:inherit}
 .lane{
   width:max-content; max-width:1400px; margin-bottom:26px; border-radius:14px;
   border:1px solid color-mix(in srgb, var(--hue) 28%, #000);
-  background:color-mix(in srgb, var(--hue) 4%, #050506);
+  background:color-mix(in srgb, var(--hue) 4%, #000);
 }
 .lane-head{display:flex; align-items:baseline; gap:14px; padding:12px 20px; border-radius:14px 14px 0 0; background:color-mix(in srgb, var(--hue) 11%, #000)}
 .lane-name{margin:0; font-size:15px; font-weight:600; color:var(--hue); letter-spacing:-.01em}
@@ -133,8 +133,12 @@ button{font:inherit}
 .nudge{position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); text-align:center; color:var(--ink-dim); font-size:13.5px; max-width:46ch; pointer-events:none}
 
 /* ---- dock: the big terminal / transcript panel ---- */
-.dock{width:0; overflow:hidden; border-left:1px solid var(--rule); background:#000; display:flex; flex-direction:column; transition:width .18s ease}
-.dock.open{width:min(920px, 62vw)}
+.dock{--dock-w:min(920px, 62vw); position:relative; width:0; overflow:hidden; border-left:1px solid var(--rule); background:#000; display:flex; flex-direction:column; transition:width .18s ease}
+.dock.open{width:var(--dock-w)}
+.dock.dragging{transition:none; user-select:none}
+.dock-grip{position:absolute; left:0; top:0; bottom:0; width:7px; cursor:col-resize; z-index:5; touch-action:none}
+.dock-grip::after{content:""; position:absolute; left:0; top:0; bottom:0; width:1px; background:var(--hue); opacity:0; transition:opacity .12s}
+.dock-grip:hover::after, .dock.dragging .dock-grip::after{opacity:.9}
 .dock-tabs{display:flex; align-items:center; gap:6px; padding:8px 10px; border-bottom:1px solid var(--rule); background:var(--bay); min-width:0; overflow-x:auto}
 .chip{display:flex; align-items:center; gap:8px; border:1px solid var(--rule); background:none; color:var(--ink-mid); border-radius:6px; padding:5px 8px 5px 10px; cursor:pointer; font-size:12.5px; white-space:nowrap; max-width:220px}
 .chip:hover{color:var(--ink); border-color:var(--ink-dim)}
@@ -198,6 +202,7 @@ button{font:inherit}
       <p class="nudge" id="nudge" hidden></p>
     </div>
     <aside class="dock" id="dock" aria-label="Session panel">
+      <div class="dock-grip" id="dockGrip" title="Drag to resize, double-click to reset"></div>
       <div class="dock-tabs" id="tabs"></div>
       <div class="dock-body">
         <form class="newform" id="newForm" hidden>
