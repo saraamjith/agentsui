@@ -11,7 +11,9 @@
   // ---- board -------------------------------------------------------------
 
   function renderBoard(s) {
-    const html = AgentsCards.board(s, { showHidden, showStale, selected, open: AgentsTerms.ids() });
+    const visible = { ...s, sessions: s.sessions.concat(
+      [...drafts.values()].filter((d) => !s.sessions.some((r) => r.id === d.id))) };
+    const html = AgentsCards.board(visible, { showHidden, showStale, selected, open: AgentsTerms.ids() });
     const empty = !html;
     $("nudge").hidden = !empty;
     if (empty) {
@@ -46,15 +48,21 @@
     return "";
   }
   const hooks = {
+    onReady(id, terminal) {
+      const r = row(id);
+      if (r) r.terminalId = terminal.id;
+      poll();
+    },
     onStatus(id, status, message) {
       if (id !== selected) return;
       note(message || "", status === "error" ? "bad" : status === "closed" ? "" : "");
     },
-    onClose(id) {
+    onClose(id, ended) {
       drafts.delete(id);
       renderTabs();
       if (state) renderBoard(state);
-      if (id === selected) note("Terminal ended - click the card again to start another.", "");
+      if (id === selected) note(ended ? "Terminal ended." : "Disconnected — click the card to reconnect.", "");
+      poll();
     },
   };
 
@@ -85,19 +93,28 @@
 
   function newHint() {
     $("newHint").textContent = $("newAgent").value === "shell"
-      ? "Runs a plain login shell on a pty in that folder - ssh in, run anything by hand. It is not tracked as a session card."
-      : "Runs the real CLI on a pty in that folder. The session shows up as a card once it writes its first transcript.";
+      ? "Runs a plain login shell on a pty in that folder - ssh in, run anything by hand. It appears on the board immediately."
+      : "Runs the real CLI on a pty in that folder. The terminal appears on the board immediately and survives page reloads.";
   }
 
   function startDraft(agent, dir) {
     dir = dir.trim();
     if (!dir) return;
-    const id = "new-" + Date.now().toString(36);
+    const id = "new-" + crypto.randomUUID();
     const name = dir.replace(/\/+$/, "").split("/").pop() || dir;
     const title = agent === "shell" ? "shell in " + name : "new " + agent + " in " + name;
-    drafts.set(id, { id, agent, newIn: dir, cwd: dir, project: name, title });
+    drafts.set(id, { id, agent, newIn: dir, cwd: dir, project: name, title,
+      mtime: Date.now() / 1000, age: 0, status: "idle" });
     $("newForm").hidden = true;
     openPanel(id, "term");
+    setTimeout(() => {
+      const card = layer.querySelector('[data-id="' + CSS.escape(id) + '"]');
+      if (!card) return;
+      const bounds = card.getBoundingClientRect(), view = stage.getBoundingClientRect();
+      const place = AgentsCanvas.transform();
+      AgentsCanvas.setTransform(place.x + view.left + view.width / 2 - bounds.left - bounds.width / 2,
+        place.y + view.top + view.height / 2 - bounds.top - bounds.height / 2, place.k);
+    }, 250);
   }
 
   function openPanel(id, which) {
@@ -107,6 +124,7 @@
     if (!r.newIn && which === "term" && lockedReason(id)) which = "log";
     if (r.agentId) { note("Subagent transcripts cannot be resumed.", "bad"); return; }
     selected = id;
+    try { sessionStorage.setItem("agentsui.selected", id); } catch (_) {}
     tab = which || "term";
     dock.classList.add("open");
     dock.style.setProperty("--hue", AgentsCards.hueFor(r.project || r.cwd));
@@ -133,10 +151,13 @@
       }
       // One host, many live terminals: move the chosen one in, park the rest.
       host.replaceChildren();
-      AgentsTerms.open(host, r, hooks);
+      if (!AgentsTerms.open(host, r, hooks)) {
+        note("Could not open terminal; close an existing terminal and try again.", "bad");
+        return;
+      }
       note(r.newIn ? (r.agent === "shell"
-            ? "Shell in " + r.newIn + " - runs until you close it, not tracked as a card."
-            : "New " + r.agent + " session in " + r.newIn + " - its card appears once it writes a transcript.") : "", "");
+            ? "Shell in " + r.newIn + " - keeps running across page reloads."
+            : "New " + r.agent + " session in " + r.newIn + " - shown on the board; keeps running across page reloads.") : "", "");
       setTimeout(() => AgentsTerms.refit(r.id), 220);   // after the dock finishes widening
     } else {
       note("", "");
@@ -145,7 +166,7 @@
   }
 
   function renderTabs() {
-    const ids = AgentsTerms.ids();
+    const ids = [...new Set([...AgentsTerms.ids(), ...(state ? state.sessions.filter((r) => r.terminalId).map((r) => r.id) : [])])];
     const chip = (id, label, on, closable) => {
       const r = row(id);
       const st = r ? AgentsCards.statusOf(r) : { cls: "s-idle" };
@@ -169,7 +190,7 @@
       else html += chip(selected, "Terminal", tab === "term", false);
     }
     const cur = row(selected);
-    if (cur && !cur.newIn) {
+    if (cur && cur.file) {
       html += '<button class="chip chip-log' + (tab === "log" ? " on" : "") + '" data-log="1">Transcript</button>';
     }
     html += '<button class="chip chip-plus' + (!$("newForm").hidden ? " on" : "") + '" data-new="" title="Start a new terminal">+</button>';
@@ -201,6 +222,7 @@
   function closePanel() {
     dock.classList.remove("open");
     selected = null;
+    try { sessionStorage.removeItem("agentsui.selected"); } catch (_) {}
     if (state) renderBoard(state);
   }
 
@@ -211,7 +233,7 @@
     $("railHead").innerHTML = '<b>Live processes</b>' + terms.length +
       " running &middot; " + (state ? state.sessions.filter((r) => !r.stale).length : 0) + " sessions this week";
     if (!terms.length) {
-      const html = '<p class="rail-empty">No claude processes running.</p>';
+      const html = '<p class="rail-empty">No agent terminals running.</p>';
       if (html !== railSig) { railSig = html; rail.innerHTML = html; }
       return;
     }
@@ -234,7 +256,7 @@
       '" data-hosted="' + (t.hosted ? 1 : 0) + '" style="--hue:' + hue + '">' +
       '<div class="term-top"><span class="dot ' + band + '"></span>' +
       '<span class="term-tty">' + AgentsCards.esc(t.tty) + "</span>" +
-      '<span class="term-agent">' + (t.agent === "codex" ? "codex" : "claude") + "</span>" +
+      '<span class="term-agent">' + (t.agent || "claude") + "</span>" +
       '<span class="term-pid">' + t.pid + "</span></div>" +
       '<div class="term-proj">' + AgentsCards.esc(t.project || t.cwd || "?") +
       (t.hosted ? '<span class="tag">here</span>' : "") + "</div>" +
@@ -271,15 +293,26 @@
 
   const post = (path, body) => fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) }).catch(() => {});
 
+  let restoredPanel = false;
   function draw(s) {
     if (stamp == null) stamp = s.build;
     else if (s.build !== stamp) { location.reload(); return; }   // front-end changed on disk
     state = s;
+    for (const r of s.sessions) {
+      if (r.terminalId) drafts.delete(r.id);
+    }
     $("host").textContent = s.host;
     renderTally(s);
     renderRail(s.terminals);
     renderBoard(s);
-    if (selected) renderTabs();
+    if (selected && !row(selected)) closePanel();
+    if (selected || s.hosted.length) renderTabs();
+    if (!restoredPanel) {
+      restoredPanel = true;
+      let previous;
+      try { previous = sessionStorage.getItem("agentsui.selected"); } catch (_) {}
+      if (previous && row(previous) && row(previous).terminalId) openPanel(previous, "term");
+    }
   }
 
   async function poll() {
@@ -364,11 +397,22 @@
     openPanel(card.dataset.id);
   });
 
-  $("tabs").addEventListener("click", (ev) => {
+  $("tabs").addEventListener("click", async (ev) => {
     const plus = ev.target.closest("[data-new]");
     if (plus) { openForm(); return; }
     const kill = ev.target.closest("[data-kill]");
-    if (kill) { ev.stopPropagation(); AgentsTerms.close(kill.dataset.kill); renderTabs(); if (state) renderBoard(state); return; }
+    if (kill) {
+      ev.stopPropagation();
+      const id = kill.dataset.kill;
+      try {
+        await AgentsTerms.close(id, row(id));
+        drafts.delete(id);
+        if (selected === id) closePanel();
+        await poll();
+        renderTabs();
+      } catch (_) { note("Could not end terminal. Try again.", "bad"); }
+      return;
+    }
     const open = ev.target.closest("[data-open]");
     if (open) return openPanel(open.dataset.open, "term");
     if (ev.target.closest("[data-log]")) { if (selected) openPanel(selected, "log"); return; }

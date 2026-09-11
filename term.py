@@ -17,6 +17,7 @@ import struct
 import termios
 import threading
 import time
+import uuid
 
 # Markers that identify the Claude Code session this server was started from.
 # A terminal we spawn must not inherit them: CLAUDE_CODE_CHILD_SESSION in
@@ -122,22 +123,78 @@ def spawn(argv, cwd, rows=40, cols=120):
     return pid, fd
 
 
-class Terminals:
-    """Registry of the pty sessions this server is hosting."""
+class HostedTerminal:
+    """A PTY owned by the server, independently of browser connections."""
 
+    def __init__(self, argv, cwd, label, agent, client_id, session):
+        self.pid, self.fd = spawn(argv, cwd)
+        self.info = {
+            "id": "t-" + uuid.uuid4().hex, "label": label, "cwd": cwd,
+            "pid": self.pid, "started": time.time(), "agent": agent,
+            "clientId": client_id, "session": session,
+        }
+        self.info["clientId"] = client_id or self.info["id"]
+        self.lock = threading.Lock()
+        self.output = bytearray()
+        self.offset = 0
+        self.stopping = threading.Event()
+        self.finished = threading.Event()
+        self.thread = threading.Thread(target=self._read, daemon=True)
+
+    def _read(self):
+        try:
+            while not self.stopping.is_set():
+                if not select.select([self.fd], [], [], .1)[0]:
+                    continue
+                data = os.read(self.fd, 65536)
+                if not data:
+                    break
+                with self.lock:
+                    self.output.extend(data)
+                    excess = len(self.output) - 2 * 1024 * 1024
+                    if excess > 0:
+                        del self.output[:excess]
+                        self.offset += excess
+        except OSError:
+            pass
+        finally:
+            try:
+                _reap(self.pid, self.fd)
+            finally:
+                self.finished.set()
+                REGISTRY.drop(self.info["id"])
+
+    def read_since(self, cursor):
+        with self.lock:
+            start = max(0, cursor - self.offset)
+            return self.offset + len(self.output), bytes(self.output[start:])
+
+    def stop(self):
+        self.stopping.set()
+        self.thread.join(timeout=5)
+
+
+class Terminals:
     def __init__(self):
         self.live = {}
         self.lock = threading.Lock()
-        self.seq = 0
 
-    def add(self, label, cwd, pid):
+    def open(self, argv, cwd, label, agent, client_id=None, session=None):
         with self.lock:
-            self.seq += 1
-            key = f"t{self.seq}"
-            self.live[key] = {
-                "id": key, "label": label, "cwd": cwd, "pid": pid, "started": time.time(),
-            }
-        return key
+            for entry in self.live.values():
+                if ((client_id and entry.info["clientId"] == client_id) or
+                        (session and entry.info["session"] == session)):
+                    return entry
+            if len(self.live) >= 6:
+                raise ValueError("too many terminals open (6)")
+            entry = HostedTerminal(argv, cwd, label, agent, client_id, session)
+            self.live[entry.info["id"]] = entry
+            entry.thread.start()
+            return entry
+
+    def get(self, key):
+        with self.lock:
+            return self.live.get(key)
 
     def drop(self, key):
         with self.lock:
@@ -145,34 +202,42 @@ class Terminals:
 
     def listing(self):
         with self.lock:
-            return list(self.live.values())
-
+            return [dict(entry.info) for entry in self.live.values()]
 
     def shutdown(self):
-        """Hang up every hosted terminal, so stopping the server leaves none behind."""
-        for entry in self.listing():
-            try:
-                os.kill(entry["pid"], signal.SIGHUP)
-            except OSError:
-                pass
+        with self.lock:
+            entries = list(self.live.values())
+        for entry in entries:
+            entry.stopping.set()
+        for entry in entries:
+            entry.thread.join(timeout=5)
 
 
 REGISTRY = Terminals()
 
 
-def serve(handler, argv, cwd, label):
-    """Upgrade the connection and relay it to a pty until either side closes."""
+def serve(handler, argv=None, cwd=None, label=None, agent=None,
+          client_id=None, session=None, terminal_id=None):
+    """Connect a browser to a persistent PTY; socket loss only detaches it."""
     key = handler.headers.get("Sec-WebSocket-Key")
     if not key:
         handler.send_error(400, "expected a websocket upgrade")
         return
-
-    # Only this console may open terminals. Browsers allow cross-origin
-    # websockets, so without this any page the user visits could spawn one.
     origin = handler.headers.get("Origin")
     if origin and origin not in handler.allowed_origins():
         handler.send_error(403, "origin not allowed")
         return
+    if terminal_id:
+        entry = REGISTRY.get(terminal_id)
+        if entry is None:
+            handler.send_error(404, "terminal has ended")
+            return
+    else:
+        try:
+            entry = REGISTRY.open(argv, cwd, label, agent, client_id, session)
+        except ValueError as exc:
+            handler.send_error(409, str(exc))
+            return
 
     handler.wfile.write((
         "HTTP/1.1 101 Switching Protocols\r\n"
@@ -181,67 +246,49 @@ def serve(handler, argv, cwd, label):
         f"Sec-WebSocket-Accept: {accept_key(key)}\r\n\r\n"
     ).encode())
     handler.wfile.flush()
-
     sock = handler.connection
-    pid, fd = spawn(argv, cwd)
-    token = REGISTRY.add(label, cwd, pid)
-    reader = FrameReader()
+    sock.sendall(frame(json.dumps({"t": "ready", "terminal": entry.info}).encode(), OP_TEXT))
     try:
-        _relay(sock, fd, reader)
-    finally:
-        REGISTRY.drop(token)
-        _reap(pid, fd)
+        _relay(sock, entry, FrameReader())
+    except OSError:
+        pass  # Browser reload/network loss must not terminate the PTY.
 
 
-def _relay(sock, fd, reader):
+def _relay(sock, entry, reader):
+    cursor = 0
     while True:
-        try:
-            ready, _, _ = select.select([sock, fd], [], [], 60)
-        except (OSError, ValueError):
+        cursor, data = entry.read_since(cursor)
+        if data:
+            sock.sendall(frame(data))
+        if entry.finished.is_set():
+            sock.sendall(frame(json.dumps({"t": "ended"}).encode(), OP_TEXT))
+            sock.sendall(frame(b"", OP_CLOSE))
             return
-        if not ready:
-            try:
-                sock.sendall(frame(b"", OP_PING))
-            except OSError:
-                return
+        if not select.select([sock], [], [], .05)[0]:
             continue
-
-        if fd in ready:
-            try:
-                data = os.read(fd, 65536)
-            except OSError:
-                return                       # child exited, pty closed
-            if not data:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return
+        reader.feed(chunk)
+        while True:
+            got = reader.pop()
+            if not got:
+                break
+            opcode, payload = got
+            if opcode == OP_CLOSE:
+                sock.sendall(frame(b"", OP_CLOSE))
                 return
-            try:
-                sock.sendall(frame(data, OP_BINARY))
-            except OSError:
-                return
-
-        if sock in ready:
-            try:
-                chunk = sock.recv(65536)
-            except OSError:
-                return
-            if not chunk:
-                return
-            reader.feed(chunk)
-            while True:
-                got = reader.pop()
-                if not got:
-                    break
-                opcode, payload = got
-                if opcode == OP_CLOSE:
+            if opcode == OP_PING:
+                sock.sendall(frame(payload, OP_PONG))
+            elif opcode == OP_TEXT:
+                try:
+                    msg = json.loads(payload)
+                except ValueError:
+                    continue
+                if msg.get("t") == "close":
+                    entry.stop()
                     return
-                if opcode == OP_PING:
-                    try:
-                        sock.sendall(frame(payload, OP_PONG))
-                    except OSError:
-                        return
-                    continue
-                if opcode != OP_TEXT:
-                    continue
-                if not _control(fd, payload):
+                if not _control(entry.fd, payload):
                     return
 
 
@@ -262,28 +309,52 @@ def _control(fd, payload):
     return True
 
 
-def _reap(pid, fd):
-    for sig in (signal.SIGHUP, signal.SIGTERM):
+def _stop_group(pid):
+    # pty.fork() makes the child a session/process-group leader. Codex's
+    # Node launcher starts a native child in that group; waiting only for
+    # the launcher can leave the native child holding the conversation lock.
+    launcher_reaped = False
+    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):
         try:
-            os.kill(pid, sig)
-        except OSError:
-            break
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            # The connection can close before the forked child calls setsid.
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                break
+        except PermissionError:
+            # macOS can report EPERM for a group containing only zombies.
+            # Keep waiting so they can be reaped before escalating again.
+            pass
         for _ in range(20):
             try:
-                if os.waitpid(pid, os.WNOHANG)[0]:
+                launcher_reaped = bool(os.waitpid(pid, os.WNOHANG)[0])
+            except ChildProcessError:
+                launcher_reaped = True
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                if launcher_reaped:
                     break
-            except OSError:
-                break
+            except PermissionError:
+                pass
             time.sleep(0.05)
         else:
             continue
         break
-    else:
+    # Reap the launcher even when it was already a zombie on entry.
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def _reap(pid, fd):
+    try:
+        _stop_group(pid)
+    finally:
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.close(fd)
         except OSError:
             pass
-    try:
-        os.close(fd)
-    except OSError:
-        pass

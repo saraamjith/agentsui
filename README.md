@@ -42,9 +42,8 @@ canvas transform, so it is always full size regardless of zoom.
 - **+ terminal** (toolbar, the `+` chip, or `+ terminal` on a lane) starts a
   fresh session: pick Claude Code, Codex, or a plain shell, and a folder - lanes
   pre-fill their own folder, and the field suggests every folder seen on the
-  board. Claude/Codex show up as a card once they write a transcript; a plain
-  shell (for sshing in or running anything by hand) runs in the dock and is not
-  tracked as a card.
+  board. New terminals show up as cards immediately; a plain
+  shell (for sshing in or running anything by hand) also has a card while running.
 
 Two things worth knowing:
 
@@ -60,7 +59,12 @@ Two things worth knowing:
   Left in place, `CLAUDE_CODE_CHILD_SESSION` turns off transcript saving and the
   new session would never appear on the board.
 
-Terminals are hung up from their chip, and on server shutdown.
+Terminals belong to the server and survive page reloads or a disconnected browser.
+New terminals (including plain shells) appear on the board immediately. Click a
+card to reconnect to the same process; the last 2 MiB of output is replayed. The
+selected terminal is reopened after reload. The panel's × only hides the panel;
+the × on a terminal chip ends that terminal and its child processes. Server
+shutdown still ends hosted terminals.
 
 ## Agents
 

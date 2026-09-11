@@ -53,27 +53,46 @@
 
   function connect(entry, session) {
     try {
-      const url = session.newIn
-        ? `ws://${location.host}/ws/term?cwd=${encodeURIComponent(session.newIn)}&agent=${encodeURIComponent(session.agent || "claude")}`
-        : `ws://${location.host}/ws/term?file=${encodeURIComponent(session.file)}`;
+      const url = session.terminalId
+        ? `ws://${location.host}/ws/term?terminal=${encodeURIComponent(session.terminalId)}`
+        : session.newIn
+        ? `ws://${location.host}/ws/term?cwd=${encodeURIComponent(session.newIn)}&agent=${encodeURIComponent(session.agent || "claude")}&client=${encodeURIComponent(session.id)}`
+        : `ws://${location.host}/ws/term?file=${encodeURIComponent(session.file)}&client=${encodeURIComponent(session.id)}`;
       const sock = new WebSocket(url);
       sock.binaryType = "arraybuffer";
       entry.sock = sock;
 
       sock.onopen = () => {
+        if (entry.endRequested) {
+          sock.send(JSON.stringify({ t: "close" }));
+          sock.close();
+          return;
+        }
         if (entry.destroyed) return;
         reportStatus(entry, "live");
         doFit(entry);
       };
       sock.onmessage = (ev) => {
         if (entry.destroyed) return;
+        if (typeof ev.data === "string") {
+          const msg = JSON.parse(ev.data);
+          if (msg.t === "ready") {
+            entry.terminalId = msg.terminal.id;
+            safeCall(() => entry.hooks.onReady && entry.hooks.onReady(entry.id, msg.terminal));
+          }
+          if (msg.t === "ended") entry.ended = true;
+          return;
+        }
         safeCall(() => entry.term.write(new Uint8Array(ev.data)));
       };
       sock.onclose = () => {
         if (entry.destroyed) return;
-        safeCall(() => entry.term.write("\r\n\x1b[2m[terminal ended]\x1b[0m\r\n"));
+        registry.delete(entry.id);
+        safeCall(() => entry.term.write(entry.ended
+          ? "\r\n[terminal ended]\r\n" : "\r\n[disconnected — click the card to reconnect]\r\n"));
         reportStatus(entry, "closed");
-        safeCall(() => entry.hooks && entry.hooks.onClose && entry.hooks.onClose(entry.id));
+        safeCall(() => entry.ro && entry.ro.disconnect());
+        safeCall(() => entry.hooks && entry.hooks.onClose && entry.hooks.onClose(entry.id, !!entry.ended));
       };
       sock.onerror = () => {
         if (entry.destroyed) return;
@@ -101,7 +120,7 @@
 
     const entry = {
       id, term, fit, container, hooks,
-      sock: null, ro: null, resizeTimer: null, destroyed: false,
+      sock: null, ro: null, resizeTimer: null, destroyed: false, terminalId: session.terminalId,
     };
 
     term.onData((d) => {
@@ -160,13 +179,26 @@
       }
     },
 
-    close(id) {
-      try {
-        const entry = registry.get(id);
-        if (!entry) return;
-        teardown(entry);
-        registry.delete(id);
-      } catch (e) { /* idempotent, swallow */ }
+    async close(id, session) {
+      const entry = registry.get(id);
+      const terminalId = (entry && entry.terminalId) || (session && session.terminalId);
+      if (terminalId) {
+        const response = await fetch("/api/terminal/close", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: terminalId }),
+        });
+        if (!response.ok) throw new Error("Could not end terminal");
+      } else if (entry) {
+        entry.endRequested = true;
+        if (entry.sock && entry.sock.readyState === 1) {
+          entry.sock.send(JSON.stringify({ t: "close" }));
+        } else if (entry.sock && entry.sock.readyState === 0) {
+          // Complete the handshake so the server receives the explicit close.
+          return;
+        }
+      }
+      if (entry) teardown(entry);
+      registry.delete(id);
     },
 
     closeAll() {

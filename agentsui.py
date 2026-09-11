@@ -426,7 +426,7 @@ def scan_terminals():
     """Live `claude` CLI processes, with the directory each one is working in."""
     try:
         out = subprocess.run(
-            ["ps", "-eo", "pid=,tty=,etime=,command="],
+            ["ps", "-eo", "pid=,pgid=,tty=,etime=,command="],
             capture_output=True, text=True, timeout=5,
         ).stdout
     except (OSError, subprocess.SubprocessError):
@@ -434,10 +434,10 @@ def scan_terminals():
 
     procs = []
     for line in out.splitlines():
-        parts = line.split(None, 3)
-        if len(parts) < 4:
+        parts = line.split(None, 4)
+        if len(parts) < 5:
             continue
-        pid, tty, etime, command = parts
+        pid, pgid, tty, etime, command = parts
         agent = agent_of(command)
         if not agent:
             continue
@@ -445,6 +445,7 @@ def scan_terminals():
             continue
         procs.append({
             "pid": int(pid),
+            "pgid": int(pgid),
             "tty": tty,
             "agent": agent,
             "uptime": etime_seconds(etime),
@@ -610,11 +611,48 @@ class Board:
             rows = [t.summary() for t in self.transcripts.values() if t.last_ts]
         terminals = scan_terminals()
         attach_sessions(terminals, rows)
-        # A pty we spawned looks identical to a real terminal window in `ps`;
-        # say which is which so the rail can tell them apart.
-        ours = {entry["pid"] for entry in term.REGISTRY.listing()}
+        hosted = term.REGISTRY.listing()
+        by_pid = {entry["pid"]: entry for entry in hosted}
         for item in terminals:
-            item["hosted"] = item["pid"] in ours
+            owner = by_pid.get(item.get("pgid")) or by_pid.get(item["pid"])
+            item["hosted"] = bool(owner)
+            if owner:
+                item["session"] = owner["clientId"]
+        # A hosted terminal is visible immediately, even before a transcript
+        # exists (and plain shells never create a transcript).
+        claimed = set()
+        for entry in hosted:
+            source = next((r for r in rows if r["id"] == entry["session"]), None)
+            if source is None and entry["agent"] != "shell":
+                candidates = [r for r in rows if r["agent"] == entry["agent"]
+                              and r["cwd"] == entry["cwd"] and not r["agentId"]
+                              and r["id"] not in claimed
+                              and (r["firstTs"] or 0) >= entry["started"] - 1]
+                if candidates:
+                    source = min(candidates, key=lambda r: r["firstTs"])
+                    live = term.REGISTRY.get(entry["id"])
+                    if live:
+                        live.info["session"] = source["id"]
+            if source:
+                claimed.add(source["id"])
+                rows = [r for r in rows if r["id"] != source["id"]]
+            card = dict(source or {})
+            card.update({
+                "id": entry["clientId"], "terminalId": entry["id"],
+                "sessionId": source["id"] if source else None,
+                "agent": entry["agent"], "cwd": entry["cwd"],
+                "project": Path(entry["cwd"]).name, "agentId": None,
+                "title": (source or {}).get("title") or entry["label"],
+                "mtime": max((source or {}).get("mtime") or 0, entry["started"]),
+                "age": 0, "status": (source or {}).get("status", "idle"),
+                "hosted": True,
+            })
+            rows.append(card)
+            if not any(t.get("pgid") == entry["pid"] or t["pid"] == entry["pid"] for t in terminals):
+                terminals.append({"pid": entry["pid"], "tty": "pty", "agent": entry["agent"],
+                                  "hosted": True, "session": entry["clientId"],
+                                  "cwd": entry["cwd"], "project": card["project"],
+                                  "title": card["title"], "uptime": time.time() - entry["started"]})
         rows.sort(key=lambda r: r["mtime"] or 0, reverse=True)
         hidden = PREFS_STORE.hidden
         titles = PREFS_STORE.titles
@@ -624,7 +662,7 @@ class Board:
             row["renamed"] = row["id"] in titles
             if row["renamed"]:
                 row["title"] = titles[row["id"]]
-            row["stale"] = (row["mtime"] or 0) < cutoff
+            row["stale"] = not row.get("hosted") and (row["mtime"] or 0) < cutoff
         return {
             "now": time.time(),
             "sessions": [r for r in rows if not r["agentId"]],
@@ -747,6 +785,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _terminal(self, query):
         """Open a pty running an agent, either resuming a session or starting one."""
+        terminal_id = query.get("terminal", [""])[0]
+        if terminal_id:
+            self.close_connection = True
+            return term.serve(self, terminal_id=terminal_id)
+        client_id = query.get("client", [""])[0]
+        session = None
         want = query.get("file", [""])[0]
         cwd = os.path.expanduser(query.get("cwd", [""])[0])
         agent = query.get("agent", ["claude"])[0]
@@ -764,12 +808,14 @@ class Handler(BaseHTTPRequestHandler):
             if data["id"] == SELF_SESSION:
                 return self.send_error(409, "that session is running AgentsUI itself")
             cwd = data.get("cwd") or cwd
-            argv = RESUME[data.get("agent", "claude")](data["id"])
+            agent = data.get("agent", "claude")
+            session = data["id"]
+            argv = RESUME[agent](session)
             label = data.get("title") or data["id"][:8]
         if not cwd or not os.path.isdir(cwd):
             return self.send_error(400, "no working directory")
         self.close_connection = True   # the socket is the websocket now
-        term.serve(self, argv, cwd, label)
+        term.serve(self, argv, cwd, label, agent, client_id, session)
 
     def do_POST(self):
         url = urlparse(self.path)
@@ -779,6 +825,11 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, OSError):
             return self._send(400, b'{"error":"bad body"}', "application/json")
         try:
+            if url.path == "/api/terminal/close":
+                entry = term.REGISTRY.get(body.get("id"))
+                if entry:
+                    entry.stop()
+                return self._send(200, b'{"ok":true}', "application/json")
             if url.path == "/api/hide":
                 sid = body.get("id")
                 if not sid:
