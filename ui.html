@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentsUI</title>
+<link rel="stylesheet" href="/vendor/xterm.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ground:#000; --bay:#0A0A0C; --strip:#121215; --strip-hi:#1A1A1F;
+  --rule:#26262E; --rule-soft:#1C1C22;
+  --ink:#F2F2F5; --ink-mid:#B9B9C6; --ink-dim:#80808E;
+  --live:#CAFFBF; --warm:#FFD6A5; --cold:#8E8EA0; --alert:#FFADAD;
+  --hue:#BDB2FF;
+  --sans:"Space Grotesk",system-ui,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%; overflow:hidden}
+body{margin:0; background:var(--ground); color:var(--ink); font-family:var(--sans); font-size:14px; line-height:1.5; -webkit-font-smoothing:antialiased}
+:focus-visible{outline:2px solid var(--warm); outline-offset:2px}
+button{font:inherit}
+
+.frame{display:grid; grid-template-rows:auto 1fr; height:100vh}
+.masthead{display:flex; align-items:center; gap:16px; flex-wrap:wrap; padding:11px 18px; border-bottom:1px solid var(--rule); background:var(--bay)}
+.wordmark{font-size:16px; font-weight:700; letter-spacing:-.02em; margin:0}
+.wordmark span{background:linear-gradient(90deg,#FFADAD,#FFD6A5,#FDFFB6,#CAFFBF,#9BF6FF,#A0C4FF,#BDB2FF,#FFC6FF); -webkit-background-clip:text; background-clip:text; color:transparent}
+.host{font-family:var(--mono); font-size:11.5px; color:var(--ink-dim)}
+.tally{display:flex; gap:14px; font-family:var(--mono); font-size:11.5px; color:var(--ink-mid)}
+.tally b{color:var(--ink); font-weight:500}
+.tally i{font-style:normal; color:var(--ink-dim)}
+.term-agent{font-size:10px; color:var(--ink-dim); border:1px solid var(--rule); border-radius:3px; padding:0 4px}
+.beacon{width:7px; height:7px; border-radius:50%; background:var(--cold); display:inline-block}
+.beacon.on{background:var(--live); animation:breathe 2.4s ease-in-out infinite}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.3}}
+.tools{margin-left:auto; display:flex; align-items:center; gap:6px}
+.tbtn{background:none; border:1px solid var(--rule); color:var(--ink-dim); border-radius:4px; padding:4px 9px; cursor:pointer; font-family:var(--mono); font-size:11.5px}
+.tbtn:hover{color:var(--ink); border-color:var(--ink-dim)}
+.tbtn.on{color:var(--warm); border-color:var(--warm)}
+.zoom{min-width:50px; text-align:center}
+.tbtn-new{color:var(--live); border-color:color-mix(in srgb, var(--live) 45%, var(--rule))}
+.tbtn-go{color:var(--ground); background:var(--live); border-color:var(--live); font-weight:500}
+.lane-new{margin-left:auto; background:none; border:1px solid color-mix(in srgb, var(--hue) 35%, #000); color:var(--hue); border-radius:5px; padding:3px 9px; cursor:pointer; font-family:var(--mono); font-size:11.5px; opacity:.75}
+.lane-new:hover{opacity:1; background:color-mix(in srgb, var(--hue) 12%, #000)}
+.chip-plus{padding:5px 10px; font-size:15px; line-height:1}
+.chip.locked{color:var(--ink-dim); border-color:var(--rule); cursor:default; opacity:.7}
+.newform{position:absolute; inset:0; padding:28px 32px; background:var(--bay); display:flex; flex-direction:column; gap:16px; max-width:520px}
+.newform[hidden]{display:none}
+.newform h2{margin:0 0 4px; font-size:17px; font-weight:600}
+.newform label{display:flex; flex-direction:column; gap:6px; font-size:12.5px; color:var(--ink-dim)}
+.newform select, .newform input{font:inherit; font-size:14px; color:var(--ink); background:var(--ground); border:1px solid var(--rule); border-radius:6px; padding:9px 11px}
+.newform input{font-family:var(--mono); font-size:13px}
+.newform select:focus, .newform input:focus{outline:none; border-color:var(--live)}
+.newform-hint{margin:0; font-size:12.5px; color:var(--ink-dim); line-height:1.5}
+.newform-row{display:flex; gap:8px}
+
+.body{display:grid; grid-template-columns:214px 1fr auto; min-height:0}
+
+/* ---- rail ---- */
+.rail{border-right:1px solid var(--rule); background:var(--bay); overflow-y:auto; padding:14px 0}
+.rail-head{padding:0 14px 11px; font-size:11.5px; color:var(--ink-dim); font-family:var(--mono); line-height:1.45}
+.rail-head b{display:block; color:var(--ink-mid); font-weight:400; font-size:12.5px; font-family:var(--sans)}
+.term{display:block; width:100%; text-align:left; border:0; background:none; color:inherit; cursor:pointer; padding:10px 14px 10px 12px; border-left:3px solid var(--hue); border-bottom:1px solid var(--rule-soft)}
+.term:hover{background:var(--strip)}
+.rail-group{padding:14px 14px 7px; font-family:var(--mono); font-size:10.5px; color:var(--ink-dim); border-top:1px solid var(--rule-soft)}
+.rail-group:first-child{border-top:0; padding-top:0}
+.tag{font-family:var(--mono); font-size:9.5px; color:var(--ground); background:var(--hue); border-radius:3px; padding:1px 4px; margin-left:6px; vertical-align:1px}
+.term-top{display:flex; align-items:center; gap:7px; font-family:var(--mono); font-size:12px}
+.term-tty{color:var(--ink); font-weight:500}
+.term-pid{color:var(--ink-dim); margin-left:auto; font-size:10.5px}
+.term-proj{font-size:12.5px; color:var(--ink-mid); margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.term-what{font-size:11.5px; color:var(--ink-dim); margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.dot{width:6px; height:6px; border-radius:50%; flex:none; background:var(--cold)}
+.dot.live{background:var(--live)} .dot.warm{background:var(--warm)}
+.rail-empty{padding:0 14px; color:var(--ink-dim); font-size:12.5px}
+
+/* ---- board ---- */
+.stage{position:relative; overflow:hidden; background:var(--ground); background-image:radial-gradient(var(--rule) 1px, transparent 1px); background-size:28px 28px; cursor:grab; min-width:0}
+.stage.panning{cursor:grabbing}
+.layer{position:absolute; inset:0; transform-origin:0 0; will-change:transform; padding:28px 32px}
+
+.lane{
+  width:max-content; max-width:1400px; margin-bottom:26px; border-radius:14px;
+  border:1px solid color-mix(in srgb, var(--hue) 28%, #000);
+  background:color-mix(in srgb, var(--hue) 4%, #050506);
+}
+.lane-head{display:flex; align-items:baseline; gap:14px; padding:12px 20px; border-radius:14px 14px 0 0; background:color-mix(in srgb, var(--hue) 11%, #000)}
+.lane-name{margin:0; font-size:15px; font-weight:600; color:var(--hue); letter-spacing:-.01em}
+.lane-note{font-family:var(--mono); font-size:11.5px; color:var(--ink-dim)}
+.lane-cards{display:flex; flex-wrap:wrap; gap:18px; padding:20px}
+
+.card{
+  width:300px; border-radius:12px; overflow:hidden; cursor:pointer; background:#0D0D10;
+  border:1.5px solid var(--cold); display:flex; flex-direction:column; text-align:left;
+  transition:transform .12s ease, box-shadow .12s ease;
+}
+.card:hover{transform:translateY(-2px); box-shadow:0 12px 30px rgba(0,0,0,.6)}
+.card.sel{box-shadow:0 0 0 2px var(--ink), 0 12px 30px rgba(0,0,0,.6)}
+.s-working{border-color:var(--live)} .s-waiting{border-color:var(--warm)} .s-error{border-color:var(--alert)}
+
+.band{display:flex; align-items:center; gap:9px; padding:10px 14px; font-size:14px; font-weight:500; color:var(--cold); background:color-mix(in srgb, var(--cold) 14%, #000)}
+.s-working .band{color:var(--live); background:color-mix(in srgb, var(--live) 14%, #000)}
+.s-waiting .band{color:var(--warm); background:color-mix(in srgb, var(--warm) 16%, #000)}
+.s-error .band{color:var(--alert); background:color-mix(in srgb, var(--alert) 16%, #000)}
+.pip{width:8px; height:8px; border-radius:50%; background:currentColor; flex:none}
+.s-working .pip{animation:breathe 2.4s ease-in-out infinite}
+.band-when{margin-left:auto; font-family:var(--mono); font-size:11.5px; font-weight:400; opacity:.85}
+.hide{background:none; border:0; color:inherit; opacity:0; cursor:pointer; font-size:16px; line-height:1; padding:0 2px; margin:-2px -4px -2px 0}
+.card:hover .hide, .hide:focus-visible{opacity:.7}
+.hide:hover{opacity:1}
+
+.ident{display:flex; align-items:center; gap:12px; padding:14px 14px 10px}
+.mark{width:40px; height:40px; border-radius:9px; flex:none; display:grid; place-items:center; font-size:20px; color:var(--hue); background:color-mix(in srgb, var(--hue) 14%, #000)}
+.card.open .mark{color:var(--live); background:color-mix(in srgb, var(--live) 16%, #000)}
+.ident-text{min-width:0}
+.name{margin:0; font-size:17px; font-weight:600; line-height:1.25; letter-spacing:-.01em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.sub{font-size:12px; color:var(--ink-dim); margin-top:2px}
+.agent-name{color:var(--ink-mid)}
+.on-tty{color:var(--warm)}
+.sub .bad{color:var(--alert)}
+
+.task{margin:0 14px 12px; padding:10px 12px; border-radius:8px; background:color-mix(in srgb, var(--hue) 8%, #000)}
+.task-tag{font-family:var(--mono); font-size:11.5px; color:var(--hue); margin-bottom:3px}
+.task-text{font-size:13px; line-height:1.4; color:var(--ink-mid); display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden}
+
+.facts{padding:0 14px 14px; display:flex; flex-direction:column; gap:5px; margin-top:auto}
+.fact{display:flex; align-items:center; gap:8px; font-family:var(--mono); font-size:12px; color:var(--ink-mid); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.glyph{color:var(--ink-dim); width:14px; text-align:center; flex:none}
+
+.nudge{position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); text-align:center; color:var(--ink-dim); font-size:13.5px; max-width:46ch; pointer-events:none}
+
+/* ---- dock: the big terminal / transcript panel ---- */
+.dock{width:0; overflow:hidden; border-left:1px solid var(--rule); background:#000; display:flex; flex-direction:column; transition:width .18s ease}
+.dock.open{width:min(920px, 62vw)}
+.dock-tabs{display:flex; align-items:center; gap:6px; padding:8px 10px; border-bottom:1px solid var(--rule); background:var(--bay); min-width:0; overflow-x:auto}
+.chip{display:flex; align-items:center; gap:8px; border:1px solid var(--rule); background:none; color:var(--ink-mid); border-radius:6px; padding:5px 8px 5px 10px; cursor:pointer; font-size:12.5px; white-space:nowrap; max-width:220px}
+.chip:hover{color:var(--ink); border-color:var(--ink-dim)}
+.chip.on{color:var(--ink); border-color:var(--hue); background:color-mix(in srgb, var(--hue) 10%, #000)}
+.chip .t{overflow:hidden; text-overflow:ellipsis}
+.chip .pip{width:7px; height:7px}
+.chip .x{opacity:.55; font-size:14px; line-height:1; padding:0 2px}
+.chip .x:hover{opacity:1}
+.chip-log{margin-left:auto}
+.dock-close{background:none; border:0; color:var(--ink-dim); font-size:20px; line-height:1; cursor:pointer; padding:2px 8px; border-radius:4px}
+.dock-close:hover{color:var(--ink); background:var(--strip)}
+.dock-body{flex:1; min-height:0; position:relative}
+.term-host{position:absolute; inset:0; padding:10px 6px 6px 12px; background:#000}
+.term-host .xterm{height:100%}
+.term-host[hidden]{display:none}
+.log{position:absolute; inset:0; overflow-y:auto; padding:6px 18px 36px; background:var(--bay)}
+.turn{padding:9px 0; border-bottom:1px solid var(--rule-soft)}
+.turn-who{font-family:var(--mono); font-size:10.5px; color:var(--ink-dim); margin-bottom:3px}
+.turn.user .turn-who{color:var(--warm)} .turn.assistant .turn-who{color:var(--live)}
+.turn-body{font-size:13.5px; white-space:pre-wrap; overflow-wrap:anywhere; max-height:260px; overflow:hidden}
+.turn.tool{display:flex; gap:9px; align-items:baseline; border-bottom-color:transparent; padding:3px 0}
+.tool-name{font-family:var(--mono); font-size:11.5px; color:var(--ink-mid); flex:none}
+.tool-arg{font-family:var(--mono); font-size:11px; color:var(--ink-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.blank{color:var(--ink-dim); padding:36px 4px; font-size:13px; max-width:52ch}
+.dock-note{position:absolute; left:0; right:0; bottom:0; padding:6px 14px; font-family:var(--mono); font-size:11.5px; color:var(--ink-dim); background:var(--bay); border-top:1px solid var(--rule)}
+.dock-note.warn{color:var(--warm)} .dock-note.bad{color:var(--alert)}
+.dock-note:empty{display:none}
+.dock-note.ask{display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:10px 14px; font-family:var(--sans); font-size:13px; color:var(--ink-mid); line-height:1.45}
+.dock-note.ask span{flex:1; min-width:240px}
+.dock-note.ask b{color:var(--warm); font-weight:500}
+
+@media (max-width:900px){
+  .body{grid-template-columns:1fr}
+  .rail{display:none}
+  .dock.open{position:fixed; inset:0; width:100%; z-index:10}
+}
+@media (prefers-reduced-motion:reduce){ *{animation:none!important; transition:none!important} }
+</style>
+</head>
+<body>
+<div class="frame">
+  <header class="masthead">
+    <h1 class="wordmark">Agents<span>UI</span></h1>
+    <span class="host" id="host"></span>
+    <div class="tally" id="tally"></div>
+    <div class="tools">
+      <button class="tbtn tbtn-new" id="newTerm" type="button">+ terminal</button>
+      <button class="tbtn" id="showStale" type="button" hidden></button>
+      <button class="tbtn" id="showHidden" type="button" hidden></button>
+      <button class="tbtn" id="restore" type="button" hidden></button>
+      <button class="tbtn" id="zoomOut" type="button" aria-label="Zoom out">&minus;</button>
+      <button class="tbtn zoom" id="zoomPct" type="button" title="Back to 100%">100%</button>
+      <button class="tbtn" id="zoomIn" type="button" aria-label="Zoom in">+</button>
+      <button class="tbtn" id="fit" type="button">fit</button>
+    </div>
+  </header>
+  <div class="body">
+    <nav class="rail"><div class="rail-head" id="railHead">Terminals</div><div id="rail"></div></nav>
+    <div class="stage" id="stage" tabindex="0">
+      <div class="layer" id="layer"></div>
+      <p class="nudge" id="nudge" hidden></p>
+    </div>
+    <aside class="dock" id="dock" aria-label="Session panel">
+      <div class="dock-tabs" id="tabs"></div>
+      <div class="dock-body">
+        <form class="newform" id="newForm" hidden>
+          <h2>Start a terminal</h2>
+          <label>Agent
+            <select id="newAgent"><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="shell">Plain shell</option></select>
+          </label>
+          <label>Folder
+            <input id="newDir" list="dirList" placeholder="~/project" spellcheck="false" autocomplete="off">
+            <datalist id="dirList"></datalist>
+          </label>
+          <p class="newform-hint" id="newHint">Runs the real CLI on a pty in that folder. The session shows up as a card once it writes its first transcript.</p>
+          <div class="newform-row"><button class="tbtn tbtn-go" type="submit">Start</button><button class="tbtn" type="button" id="newCancel">Cancel</button></div>
+        </form>
+        <div class="term-host" id="termHost"></div>
+        <div class="log" id="log" hidden></div>
+        <div class="dock-note" id="note"></div>
+      </div>
+    </aside>
+  </div>
+</div>
+<script src="/vendor/xterm.js"></script>
+<script src="/vendor/addon-fit.js"></script>
+<script src="/canvas.js"></script>
+<script src="/cards.js"></script>
+<script src="/termclient.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
