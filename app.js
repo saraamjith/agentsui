@@ -301,6 +301,14 @@
     if (!card) return;
     if (ev.target.closest(".name.editing")) return;   // clicks inside the editor stay there
     const id = card.dataset.id;
+    if (ev.target.closest(".name") && !hide) {
+      // A click on the title might be the first half of a rename double-click,
+      // so hold the open briefly; dblclick cancels it.
+      clearTimeout(nameClickTimer);
+      if (ev.detail > 1) return;
+      nameClickTimer = setTimeout(() => openPanel(id), 260);
+      return;
+    }
     if (hide) {
       ev.stopPropagation();
       const r = row(id);
@@ -313,9 +321,11 @@
     openPanel(id);
   });
   // ---- rename a card: double-click the title, Enter saves, Escape reverts ----
+  let nameClickTimer = null;
   layer.addEventListener("dblclick", (ev) => {
     const name = ev.target.closest(".name");
     const card = ev.target.closest(".card");
+    clearTimeout(nameClickTimer);
     if (!name || !card || name.classList.contains("editing")) return;
     ev.preventDefault(); ev.stopPropagation();
     const id = card.dataset.id, r = row(id);
