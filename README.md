@@ -1,4 +1,4 @@
-<img width="1512" height="697" alt="image" src="https://github.com/user-attachments/assets/51c2e19f-28da-4c59-997c-086e9d1cfed5" />
+<img width="1504" height="783" alt="image" src="https://github.com/user-attachments/assets/b85c269c-9ab3-40a8-a747-2ff0eefa64d1" />
 
 # AgentsUI
 
