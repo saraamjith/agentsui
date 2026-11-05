@@ -185,8 +185,6 @@ class Terminals:
                 if ((client_id and entry.info["clientId"] == client_id) or
                         (session and entry.info["session"] == session)):
                     return entry
-            if len(self.live) >= 6:
-                raise ValueError("too many terminals open (6)")
             entry = HostedTerminal(argv, cwd, label, agent, client_id, session)
             self.live[entry.info["id"]] = entry
             entry.thread.start()
@@ -199,6 +197,10 @@ class Terminals:
     def drop(self, key):
         with self.lock:
             self.live.pop(key, None)
+
+    def count(self):
+        with self.lock:
+            return len(self.live)
 
     def listing(self):
         with self.lock:
@@ -233,11 +235,7 @@ def serve(handler, argv=None, cwd=None, label=None, agent=None,
             handler.send_error(404, "terminal has ended")
             return
     else:
-        try:
-            entry = REGISTRY.open(argv, cwd, label, agent, client_id, session)
-        except ValueError as exc:
-            handler.send_error(409, str(exc))
-            return
+        entry = REGISTRY.open(argv, cwd, label, agent, client_id, session)
 
     handler.wfile.write((
         "HTTP/1.1 101 Switching Protocols\r\n"

@@ -5,16 +5,15 @@
 (function () {
   "use strict";
 
-  const MAX_TERMS = 6;
   const RESIZE_DEBOUNCE_MS = 100;
 
   const THEME = {
-      background: "#000000", foreground: "#F2F2F5", cursor: "#CAFFBF", cursorAccent: "#000000",
-      selectionBackground: "#2A2A33",
-      black: "#1A1A1F", red: "#FFADAD", green: "#CAFFBF", yellow: "#FDFFB6",
-      blue: "#A0C4FF", magenta: "#FFC6FF", cyan: "#9BF6FF", white: "#E6E6EE",
-      brightBlack: "#80808E", brightRed: "#FFC2C2", brightGreen: "#DBFFD3", brightYellow: "#FEFFCB",
-      brightBlue: "#BAD4FF", brightMagenta: "#FFD6FF", brightCyan: "#BDF9FF", brightWhite: "#FFFFFF",
+      background: "#000000", foreground: "#F7F2FF", cursor: "#F5B0E0", cursorAccent: "#000000",
+      selectionBackground: "#3B2855",
+      black: "#20182C", red: "#FF91C8", green: "#9BC7FF", yellow: "#D2ADFF",
+      blue: "#86B5F9", magenta: "#E49BEF", cyan: "#AAB7FF", white: "#EEE5FA",
+      brightBlack: "#9A8DAB", brightRed: "#FFB8DF", brightGreen: "#C0DDFF", brightYellow: "#E7CCFF",
+      brightBlue: "#BAD8FF", brightMagenta: "#F5C5FF", brightCyan: "#D0D7FF", brightWhite: "#FFFFFF",
     };
 
   // registry: id -> { term, fit, sock, container, ro, hooks, resizeTimer, destroyed }
@@ -36,6 +35,12 @@
       if (entry.destroyed) return;
       try { entry.fit.fit(); } catch (e) { return; }
       sendSize(entry);
+      if (entry.scrollOnFit) {
+        entry.scrollOnFit = false;
+        entry.term.write("", () => {
+          if (!entry.destroyed) entry.term.scrollToBottom();
+        });
+      }
     });
   }
 
@@ -51,13 +56,54 @@
     safeCall(() => entry.hooks && entry.hooks.onStatus && entry.hooks.onStatus(entry.id, status, message));
   }
 
+  function endTerminal(terminalId) {
+    return fetch("/api/terminal/close", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: terminalId }),
+    });
+  }
+
+  // Ask for the pty over plain HTTP before opening the socket. A websocket the
+  // server turns down reports only "error" to the browser - no status, no body -
+  // so a refusal made over HTTP is the only kind the UI can explain.
+  async function create(session) {
+    const response = await fetch("/api/terminal/new", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client: session.id, agent: session.agent || "claude",
+        cwd: session.newIn || "", file: session.newIn ? "" : (session.file || ""),
+      }),
+    });
+    let data = null;
+    try { data = await response.json(); } catch (e) { /* an error page, not JSON */ }
+    if (!response.ok || !data || !data.terminal) {
+      throw new Error((data && data.error) || "could not start a terminal (" + response.status + ")");
+    }
+    return data.terminal;
+  }
+
+  function failed(entry, message) {
+    if (entry.destroyed) return;
+    registry.delete(entry.id);
+    safeCall(() => entry.term.write("\r\n[" + message + "]\r\n"));
+    reportStatus(entry, "error", message);
+    safeCall(() => entry.ro && entry.ro.disconnect());
+    safeCall(() => entry.hooks && entry.hooks.onFail && entry.hooks.onFail(entry.id, message));
+  }
+
   function connect(entry, session) {
+    if (session.terminalId) return openSocket(entry, session.terminalId);
+    create(session).then((terminal) => {
+      entry.terminalId = terminal.id;
+      // Closed while the pty was starting: end it rather than orphan it.
+      if (entry.destroyed || entry.endRequested) return endTerminal(terminal.id);
+      openSocket(entry, terminal.id);
+    }).catch((e) => failed(entry, e.message || "could not start a terminal"));
+  }
+
+  function openSocket(entry, terminalId) {
     try {
-      const url = session.terminalId
-        ? `ws://${location.host}/ws/term?terminal=${encodeURIComponent(session.terminalId)}`
-        : session.newIn
-        ? `ws://${location.host}/ws/term?cwd=${encodeURIComponent(session.newIn)}&agent=${encodeURIComponent(session.agent || "claude")}&client=${encodeURIComponent(session.id)}`
-        : `ws://${location.host}/ws/term?file=${encodeURIComponent(session.file)}&client=${encodeURIComponent(session.id)}`;
+      const url = `ws://${location.host}/ws/term?terminal=${encodeURIComponent(terminalId)}`;
       const sock = new WebSocket(url);
       sock.binaryType = "arraybuffer";
       entry.sock = sock;
@@ -83,7 +129,11 @@
           if (msg.t === "ended") entry.ended = true;
           return;
         }
-        safeCall(() => entry.term.write(new Uint8Array(ev.data)));
+        const scrollToLatest = entry.scrollOnNextOutput;
+        entry.scrollOnNextOutput = false;
+        safeCall(() => entry.term.write(new Uint8Array(ev.data), () => {
+          if (scrollToLatest && !entry.destroyed) entry.term.scrollToBottom();
+        }));
       };
       sock.onclose = () => {
         if (entry.destroyed) return;
@@ -121,6 +171,7 @@
     const entry = {
       id, term, fit, container, hooks,
       sock: null, ro: null, resizeTimer: null, destroyed: false, terminalId: session.terminalId,
+      scrollOnNextOutput: true, scrollOnFit: true,
     };
 
     term.onData((d) => {
@@ -139,6 +190,7 @@
     if (hooks) entry.hooks = hooks; // hooks may be refreshed across re-renders
     safeCall(() => entry.ro && entry.ro.disconnect());
     hostEl.appendChild(entry.container); // move detached container into new host
+    entry.scrollOnFit = true;
     entry.ro = new ResizeObserver(() => scheduleFit(entry));
     safeCall(() => entry.ro.observe(hostEl));
     doFit(entry);
@@ -166,11 +218,6 @@
           return id;
         }
 
-        if (registry.size >= MAX_TERMS) {
-          safeCall(() => hooks && hooks.onStatus && hooks.onStatus(id, "error", "too many terminals open (6)"));
-          return null;
-        }
-
         entry = createEntry(id, session, hooks);
         attach(entry, hostEl, hooks);
         return id;
@@ -181,21 +228,11 @@
 
     async close(id, session) {
       const entry = registry.get(id);
+      if (entry) entry.endRequested = true;   // a pending create ends it instead
       const terminalId = (entry && entry.terminalId) || (session && session.terminalId);
       if (terminalId) {
-        const response = await fetch("/api/terminal/close", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: terminalId }),
-        });
+        const response = await endTerminal(terminalId);
         if (!response.ok) throw new Error("Could not end terminal");
-      } else if (entry) {
-        entry.endRequested = true;
-        if (entry.sock && entry.sock.readyState === 1) {
-          entry.sock.send(JSON.stringify({ t: "close" }));
-        } else if (entry.sock && entry.sock.readyState === 0) {
-          // Complete the handshake so the server receives the explicit close.
-          return;
-        }
       }
       if (entry) teardown(entry);
       registry.delete(id);

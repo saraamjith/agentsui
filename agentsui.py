@@ -10,17 +10,23 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlparse, parse_qs
 
 import term
+from cluster import CLUSTERS
 
 HOME = Path.home()
 PROJECTS = HOME / ".claude" / "projects"
+# Claude Code writes <pid>.json here for each live process, naming the session
+# it is on (kept current across /resume).
+LIVE_REGISTRY = HOME / ".claude" / "sessions"
 # The session this server was launched from. Opening a terminal on it would run
 # a second claude on the same transcript and corrupt it, so the UI locks it.
 SELF_SESSION = os.environ.get("CLAUDE_CODE_SESSION_ID")
@@ -47,7 +53,9 @@ PREFS = HOME / ".claude" / "agentsui.json"
 LEGACY_PREFS = HOME / ".claude" / "fleetview.json"
 # Where the vendored xterm build lives.
 VENDOR = HERE / "vendor"
-STATIC = ("ui.html", "app.js", "cards.js", "canvas.js", "termclient.js")
+STATIC = ("ui.html", "app.js", "cards.js", "canvas.js", "termclient.js", "cluster.js")
+# Browsers ask for /favicon.ico whatever the page says; hand them the PNG.
+ICONS = {"/favicon.svg": "favicon.svg", "/favicon.png": "favicon.png", "/favicon.ico": "favicon.png"}
 
 
 def build_stamp():
@@ -673,6 +681,7 @@ class Board:
             "build": build_stamp(),
             "self": SELF_SESSION,
             "host": os.uname().nodename,
+            "clusters": [c.state() for c in CLUSTERS],
         }
 
     def detail(self, path):
@@ -687,15 +696,26 @@ class Board:
         return data
 
 
-def attach_sessions(terminals, rows):
-    """Guess which transcript each live terminal is writing.
+def registered_session(pid):
+    """The session Claude Code says this process is on, or None."""
+    try:
+        return json.loads((LIVE_REGISTRY / f"{pid}.json").read_text()).get("sessionId")
+    except (OSError, ValueError, AttributeError):
+        return None
 
-    The CLI does not hold its transcript open, so pair each terminal with the
-    session that started closest after the process did - a session cannot
-    predate the terminal it runs in. Falls back to the freshest session in the
-    same directory. It is a guess, and the UI labels it as one.
+
+def attach_sessions(terminals, rows):
+    """Find which transcript each live terminal is writing.
+
+    A claude process that registered itself under ~/.claude/sessions says so
+    directly. For the rest (Codex, older CLIs) the CLI does not hold its
+    transcript open, so pair each terminal with the session that started
+    closest after the process did - a session cannot predate the terminal it
+    runs in. Falls back to the freshest session in the same directory. That is
+    only a guess.
     """
     now = time.time()
+    by_id = {row["id"]: row for row in rows}
     by_cwd = {}
     for row in rows:
         if row["agentId"] or not row["cwd"]:
@@ -704,9 +724,28 @@ def attach_sessions(terminals, rows):
     for sessions in by_cwd.values():
         sessions.sort(key=lambda r: r["mtime"] or 0, reverse=True)
 
-    taken = set()
+    def pair(term, sid):
+        term["session"] = sid
+        row = by_id.get(sid)
+        if row:
+            term["title"] = row["title"]
+            term["streaming"] = row["streaming"]
+            term["age"] = row["age"]
+
+    # Registered sessions first, so guesses never claim them. Two processes
+    # can be on one session, and the cwd is where claude started, which the
+    # transcript's cwd stops matching once the session cds elsewhere.
+    taken, unknown = set(), []
+    for term in terminals:
+        sid = registered_session(term["pid"]) if term["agent"] == "claude" else None
+        if sid:
+            pair(term, sid)
+            taken.add(sid)
+        else:
+            unknown.append(term)
+
     # Longest-running terminals choose first; their windows are least ambiguous.
-    for term in sorted(terminals, key=lambda t: -(t.get("uptime") or 0)):
+    for term in sorted(unknown, key=lambda t: -(t.get("uptime") or 0)):
         term["session"] = None
         started = now - term["uptime"] if term.get("uptime") else None
         free = [c for c in by_cwd.get((term["agent"], term.get("cwd")), []) if c["id"] not in taken]
@@ -719,13 +758,184 @@ def attach_sessions(terminals, rows):
                 pick = min(after, key=lambda c: c["firstTs"] - started)
         pick = pick or free[0]
         taken.add(pick["id"])
-        term["session"] = pick["id"]
-        term["title"] = pick["title"]
-        term["streaming"] = pick["streaming"]
-        term["age"] = pick["age"]
+        pair(term, pick["id"])
 
 
 BOARD = Board()
+
+
+class Rejected(Exception):
+    """A terminal request the server will not run, with the reason to show."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+class Plan(NamedTuple):
+    argv: list
+    cwd: str
+    label: str
+    agent: str
+    session: str
+
+
+MEMORY_NOTE = """\
+Shared memory: this project's persistent memory is the folder {dir}. Claude Code \
+sessions read and write the same folder, so it is how you and they remember \
+things across sessions. At the start of a task, read {dir}/MEMORY.md (an index, \
+one line per memory) and open the memory files relevant to the task. When you \
+learn something worth keeping - who the user is, guidance or corrections on how \
+to work, project context that the code and git history do not record, pointers \
+to external resources - save one fact per file in that folder, starting with \
+frontmatter:
+---
+name: <short-kebab-case-slug>
+description: <one-line summary>
+metadata:
+  type: user | feedback | project | reference
+---
+then add a one-line pointer `- [Title](file.md) - hook` to MEMORY.md. Update an \
+existing memory instead of writing a duplicate, and delete one that turns out to \
+be wrong."""
+
+
+HISTORY_NOTE = """\
+Session history: earlier Claude Code and Codex sessions on this project can be \
+read, whichever agent ran them. `python3 {script} sessions` lists them newest \
+first (id, agent, date, title); `python3 {script} session <id>` prints one as a \
+readable conversation (an id prefix is enough). Look there when the user refers \
+to earlier work, or before redoing something that may already have been tried."""
+
+
+def project_root(cwd):
+    """The repository root containing cwd, or cwd itself outside git."""
+    try:
+        root = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        root = ""
+    return root or os.path.realpath(cwd)
+
+
+def slug(path):
+    """How Claude Code names a folder under ~/.claude/projects."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def memory_dir(cwd):
+    """Claude Code's memory folder for the project containing cwd.
+
+    Claude keys it by the repository root (or the folder itself outside git).
+    """
+    return PROJECTS / slug(project_root(cwd)) / "memory"
+
+
+def shared_memory_args(agent, cwd):
+    """Flags that give a new terminal the project's shared memory and history.
+
+    Claude loads its memory folder by itself and only needs to hear about the
+    session history. Codex is told where both are and allowed to write to the
+    memory folder, so memories either agent saves are seen by both.
+    """
+    history = HISTORY_NOTE.format(script=HERE / "agentsui.py")
+    if agent == "claude":
+        return ["--append-system-prompt", history]
+    folder = memory_dir(cwd)
+    folder.mkdir(parents=True, exist_ok=True)
+    note = MEMORY_NOTE.format(dir=folder) + "\n\n" + history
+    # --add-dir is rejected under read-only/restricted permission defaults.
+    # Select the workspace sandbox explicitly for both new and resumed sessions.
+    return ["--sandbox", "workspace-write", "--add-dir", str(folder),
+            "-c", "developer_instructions=" + json.dumps(note)]
+
+
+def project_sessions(cwd):
+    """Parsed Claude and Codex sessions (not subagents) run anywhere in cwd's project.
+
+    Claude files a transcript under the slug of the folder it ran in, and a
+    rollout's first line names its folder, so only matching files are parsed.
+    """
+    root = project_root(cwd)
+    inside = lambda path: bool(path) and (path == root or path.startswith(root.rstrip("/") + "/"))
+    found = []
+    for project in PROJECTS.glob(slug(root) + "*"):
+        found += [Transcript(path) for path in project.glob("*.jsonl")]
+    for path in CODEX_SESSIONS.rglob("rollout-*.jsonl") if CODEX_SESSIONS.is_dir() else ():
+        try:
+            with path.open() as f:
+                first = json.loads(f.readline())
+        except (OSError, ValueError):
+            continue
+        if inside((first.get("payload") or {}).get("cwd")):
+            found.append(CodexTranscript(path))
+    for t in found:
+        t.refresh()
+    found = [t for t in found if t.last_ts and inside(t.cwd)]
+    return sorted(found, key=lambda t: t.last_ts, reverse=True)
+
+
+def stamp(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "?"
+
+
+def history_main(args):
+    """`agentsui.py sessions [DIR]` and `agentsui.py session ID [DIR]`."""
+    command, rest = args[0], args[1:]
+    if command == "session" and not rest:
+        return "usage: agentsui.py session <id> [dir]"
+    want = rest.pop(0) if command == "session" else None
+    sessions = project_sessions(rest[0] if rest else os.getcwd())
+    if want is None:
+        for t in sessions:
+            title = PREFS_STORE.titles.get(t.session_id) or t.title or "(untitled)"
+            print(f"{t.session_id}  {t.agent:<6}  {stamp(t.last_ts)}  {title}")
+        return None
+    match = [t for t in sessions if (t.session_id or "").startswith(want)]
+    if len(match) != 1:
+        return f"{len(match)} sessions in this project match {want!r}"
+    t = match[0]
+    print(f"{t.agent} session {t.session_id} in {t.cwd}, {stamp(t.first_ts)} - {stamp(t.last_ts)}\n")
+    for item in t.timeline:
+        if item["role"] == "tool":
+            print(f"  [{item['body']}] {item['detail']}")
+        else:
+            print(f"\n{item['role'].upper()} {stamp(item['t'])}\n{item['body']}")
+    return None
+
+
+def plan_terminal(agent, cwd, want):
+    """Work out what pty a new-terminal request wants, or say why it cannot run."""
+    if agent not in NEW:
+        raise Rejected(400, "unknown agent: " + agent)
+    cwd = os.path.expanduser(cwd or "")
+    argv = list(NEW[agent])
+    session = None
+    where = os.path.basename(cwd.rstrip("/")) or cwd
+    label = ("shell in " if agent == "shell" else "new " + agent + " in ") + where
+    if want:
+        data = BOARD.detail(want)
+        if not data:
+            raise Rejected(404, "no such session")
+        if data.get("agentId"):
+            raise Rejected(400, "subagents cannot be resumed")
+        if data["id"] == SELF_SESSION:
+            raise Rejected(409, "that session is running AgentsUI itself")
+        agent = data.get("agent", "claude")
+        if agent not in RESUME:
+            raise Rejected(400, "a " + agent + " session cannot be resumed")
+        cwd = data.get("cwd") or cwd
+        session = data["id"]
+        argv = RESUME[agent](session)
+        label = data.get("title") or data["id"][:8]
+    if not cwd:
+        raise Rejected(400, "no working directory")
+    if not os.path.isdir(cwd):
+        raise Rejected(400, "no such folder: " + cwd)
+    if agent in ("claude", "codex"):
+        argv += shared_memory_args(agent, cwd)
+    return Plan(argv, cwd, label, agent, session)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -755,6 +965,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._static(VENDOR, url.path)
             if url.path.endswith(".js"):
                 return self._static(HERE, url.path)
+            if url.path in ICONS:
+                return self._static(HERE, ICONS[url.path])
             if url.path == "/ws/term":
                 return self._terminal(parse_qs(url.query))
             if url.path == "/api/session":
@@ -769,7 +981,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # keep the console up if one read goes wrong
             self._send(500, json.dumps({"error": str(exc)}).encode(), "application/json")
 
-    MIME = {".js": "text/javascript", ".css": "text/css"}
+    MIME = {".js": "text/javascript", ".css": "text/css",
+            ".svg": "image/svg+xml", ".png": "image/png"}
 
     def allowed_origins(self):
         host = self.headers.get("Host", "")
@@ -784,38 +997,42 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, target.read_bytes(), mime)
 
     def _terminal(self, query):
-        """Open a pty running an agent, either resuming a session or starting one."""
+        """Attach to a pty, creating one if the request describes a new terminal."""
         terminal_id = query.get("terminal", [""])[0]
         if terminal_id:
             self.close_connection = True
             return term.serve(self, terminal_id=terminal_id)
-        client_id = query.get("client", [""])[0]
-        session = None
-        want = query.get("file", [""])[0]
-        cwd = os.path.expanduser(query.get("cwd", [""])[0])
-        agent = query.get("agent", ["claude"])[0]
-        if agent not in NEW:
-            return self.send_error(400, "unknown agent")
-        where = os.path.basename(cwd.rstrip("/")) or cwd
-        argv = list(NEW[agent])
-        label = ("shell in " if agent == "shell" else "new " + agent + " in ") + where
-        if want:
-            data = BOARD.detail(want)
-            if not data:
-                return self.send_error(404, "no such session")
-            if data.get("agentId"):
-                return self.send_error(400, "subagents cannot be resumed")
-            if data["id"] == SELF_SESSION:
-                return self.send_error(409, "that session is running AgentsUI itself")
-            cwd = data.get("cwd") or cwd
-            agent = data.get("agent", "claude")
-            session = data["id"]
-            argv = RESUME[agent](session)
-            label = data.get("title") or data["id"][:8]
-        if not cwd or not os.path.isdir(cwd):
-            return self.send_error(400, "no working directory")
+        try:
+            plan = plan_terminal(query.get("agent", ["claude"])[0],
+                                 query.get("cwd", [""])[0], query.get("file", [""])[0])
+        except Rejected as exc:
+            return self.send_error(exc.status, exc.message)
         self.close_connection = True   # the socket is the websocket now
-        term.serve(self, argv, cwd, label, agent, client_id, session)
+        term.serve(self, plan.argv, plan.cwd, plan.label, plan.agent,
+                   query.get("client", [""])[0], plan.session)
+
+    def _new_terminal(self, body):
+        """Create a pty over plain HTTP so a refusal can be read and shown.
+
+        A websocket handshake the server turns down hands the browser neither
+        the status nor the body, so creating a terminal this way is the only
+        way the UI can tell "no such folder" from "unknown agent" instead of
+        reporting every refusal as a connection that dropped.
+        """
+        try:
+            plan = plan_terminal(body.get("agent") or "claude",
+                                 body.get("cwd") or "", body.get("file") or "")
+            entry = term.REGISTRY.open(plan.argv, plan.cwd, plan.label, plan.agent,
+                                       body.get("client") or "", plan.session)
+        except Rejected as exc:
+            return self._fail(exc.status, exc.message)
+        except OSError as exc:              # no pty or no process slot left
+            return self._fail(500, "could not start a terminal: %s" % exc)
+        payload = json.dumps({"ok": True, "terminal": entry.info}).encode()
+        return self._send(200, payload, "application/json")
+
+    def _fail(self, code, message):
+        self._send(code, json.dumps({"error": message}).encode(), "application/json")
 
     def do_POST(self):
         url = urlparse(self.path)
@@ -825,6 +1042,8 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, OSError):
             return self._send(400, b'{"error":"bad body"}', "application/json")
         try:
+            if url.path == "/api/terminal/new":
+                return self._new_terminal(body)
             if url.path == "/api/terminal/close":
                 entry = term.REGISTRY.get(body.get("id"))
                 if entry:
@@ -848,6 +1067,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, b'{"error":"no id"}', "application/json")
                 PREFS_STORE.place(sid, body)
                 return self._send(200, b'{"ok":true}', "application/json")
+            if url.path == "/api/cluster/refresh":
+                found = next((c for c in CLUSTERS if c.name == body.get("name")), None)
+                started = found and found.connected() and found.refresh()
+                return self._send(200, json.dumps({"ok": True, "started": bool(started)}).encode(), "application/json")
             if url.path == "/api/unhide-all":
                 PREFS_STORE.clear()
                 return self._send(200, b'{"ok":true}', "application/json")
@@ -873,4 +1096,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] in (["sessions"], ["session"]):
+        sys.exit(history_main(sys.argv[1:]))
     main()

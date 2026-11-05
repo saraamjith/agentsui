@@ -71,6 +71,7 @@ class ReconnectTests(unittest.TestCase):
             patch.object(agentsui, 'PROJECTS', Path(self.temp.name)),
             patch.object(agentsui, 'CODEX_SESSIONS', Path(self.temp.name)),
             patch.object(agentsui, 'BOARD', agentsui.Board()),
+            *(patch.object(c, 'connected', return_value=False) for c in agentsui.CLUSTERS),
             patch.dict(agentsui.NEW, {'shell': [sys.executable, '-u', '-c',
                        'print("READY", flush=True)\nwhile True:\n print("echo:" + input(), flush=True)']}),
         ]
@@ -95,6 +96,16 @@ class ReconnectTests(unittest.TestCase):
         ws = WebSocket(self.port, query)
         self.sockets.append(ws)
         return ws
+
+    def post(self, path, body):
+        """Like request(), but hands back refusals instead of asserting success."""
+        conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
+        conn.request('POST', path, body=json.dumps(body),
+                     headers={'Content-Type': 'application/json'})
+        response = conn.getresponse()
+        data = json.loads(response.read())
+        conn.close()
+        return response.status, data
 
     def request(self, path, body=None):
         conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
@@ -142,3 +153,46 @@ class ReconnectTests(unittest.TestCase):
         while term.REGISTRY.listing() and time.monotonic() < deadline:
             time.sleep(.05)
         self.assertFalse(term.REGISTRY.listing())
+
+    def test_create_over_http_reports_why_it_refused(self):
+        """A websocket that fails its handshake tells the browser nothing, so
+        every refusal has to be available as a readable response instead."""
+        status, data = self.post('/api/terminal/new',
+                                 {'cwd': '/no/such/folder', 'agent': 'shell', 'client': 'c1'})
+        self.assertEqual(status, 400)
+        self.assertIn('no such folder', data['error'])
+
+        status, data = self.post('/api/terminal/new',
+                                 {'cwd': self.temp.name, 'agent': 'nope', 'client': 'c2'})
+        self.assertEqual(status, 400)
+        self.assertIn('unknown agent', data['error'])
+
+    def test_terminals_are_not_capped(self):
+        """Nothing turns a terminal down for being the nth one open."""
+        for n in range(8):
+            status, data = self.post('/api/terminal/new',
+                                     {'cwd': self.temp.name, 'agent': 'shell', 'client': 'k%d' % n})
+            self.assertEqual(status, 200, data)
+            self.sockets.append(self.connect(terminal=data['terminal']['id']))
+        self.assertEqual(len(term.REGISTRY.listing()), 8)
+
+    def test_create_over_http_then_attach_by_id(self):
+        status, data = self.post('/api/terminal/new',
+                                 {'cwd': self.temp.name, 'agent': 'shell', 'client': 'new-http'})
+        self.assertEqual(status, 200, data)
+        key = data['terminal']['id']
+        self.assertEqual(data['terminal']['clientId'], 'new-http')
+        ws = self.connect(terminal=key)          # the socket only ever attaches
+        self.assertEqual(ws.info['id'], key)
+        ws.until(b'READY')
+        card = next(r for r in self.request('/api/state')['sessions'] if r['id'] == 'new-http')
+        self.assertEqual(card['terminalId'], key)
+        # A retried create is the same pty, not a second one.
+        status, again = self.post('/api/terminal/new',
+                                  {'cwd': self.temp.name, 'agent': 'shell', 'client': 'new-http'})
+        self.assertEqual((status, again['terminal']['id']), (200, key))
+        self.assertEqual(len(term.REGISTRY.listing()), 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

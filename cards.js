@@ -5,8 +5,8 @@
   "use strict";
 
   var STATUS = { working: "Working", waiting: "Needs input", error: "Error", idle: "Idle" };
-  // Pastel rainbow, one hue per project so a fleet reads as a spectrum.
-  var HUES = ["#FFADAD", "#FFD6A5", "#FDFFB6", "#CAFFBF", "#9BF6FF", "#A0C4FF", "#BDB2FF", "#FFC6FF"];
+  // Pink, blue, and purple variations give each project its own accent.
+  var HUES = ["#86B5F9", "#9BC7FF", "#C4A7FF", "#F5B0E0", "#AAB7FF", "#D2ADFF", "#FF91C8", "#E49BEF"];
 
   function esc(str) {
     return String(str == null ? "" : str).replace(/[&<>"]/g, function (c) {

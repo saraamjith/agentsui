@@ -21,9 +21,9 @@ Idle), the session title and model, one block saying what it is doing right now
 - the running tool while it works, what it said when it is waiting on you - and
 mono fact rows for directory, branch, tty and subagents.
 
-- **Colour is identity.** Black ground; each project gets a pastel hue that tints
+- **Colour is identity.** Black ground; each project gets a pink, blue, or purple hue that tints
   its lane and the card marks, so the fleet reads as a spectrum. Status is the
-  card border and band: mint working, peach needs input, pink error.
+  card border and band: blue working, purple needs input, pink error.
 - **Click a card** to open it in the dock. **x** on the band stows it. The count
   in the toolbar reveals stowed cards, and `restore all` puts them back. Only an
   id is written to `~/.claude/agentsui.json` - transcripts are never touched.
@@ -37,9 +37,10 @@ canvas transform, so it is always full size regardless of zoom.
 
 - **Terminal** spawns a real `claude --resume <session-id>` on a pty and streams
   it over a WebSocket - slash commands and their autocomplete, permission prompts,
-  shift+tab mode cycling, everything. Up to six live at once; each open one is a
-  chip in the dock's tab bar, and switching between them never reconnects or
-  drops scrollback (each xterm lives in a container the client owns and moves).
+  shift+tab mode cycling, everything. As many live at once as you like; each
+  open one is a chip in the dock's tab bar, and switching between them never
+  reconnects or drops scrollback (each xterm lives in a container the client
+  owns and moves).
 - **Transcript** shows the full log, refreshed in place as the session writes.
 - **+ terminal** (toolbar, the `+` chip, or `+ terminal` on a lane) starts a
   fresh session: pick Claude Code, Codex, or a plain shell, and a folder - lanes
@@ -81,34 +82,83 @@ Two sources feed the board, and they mix freely inside a lane:
 
 Each card says which it is on the line under the title, and the mark differs
 (a star for Claude, a hexagon for Codex). A live Codex TUI is a node wrapper plus
-the native binary on one tty; the rail shows it once. Codex's desktop app and
+the native binary on one tty; it is counted once. Codex's desktop app and
 `app-server` processes have no tty and are not listed.
 
-## The rail
+## Shared memory
 
-The rail lists live `claude` **processes** (from `ps`), which is a different set
-from the **sessions** on the board - the board includes dormant transcripts, the
-rail only what is running right now. They will not line up one-to-one.
+Claude and Codex terminals opened here share one memory per project: Claude
+Code's own auto-memory folder, `~/.claude/projects/<project>/memory/` (keyed by
+the repo root). Claude reads its `MEMORY.md` index natively. Codex terminals,
+new or resumed, are started with `--sandbox workspace-write` and `--add-dir`
+on that folder, so Codex can write there even when its default permissions are
+read-only, and a `developer_instructions` override telling it to read the index at
+the start of a task and to save memories in Claude's format (one fact per file
+with frontmatter, plus a line in `MEMORY.md`). Whatever one agent saves, the
+other sees in its next session.
 
-Rows are split into your own terminal windows and the ones AgentsUI spawned
-(tagged `here`), since `ps` cannot tell them apart on its own. Each row is tinted
-with its project hue to match the lane it belongs to. Clicking a hosted row
-focuses that terminal in the dock; clicking one of your own windows opens its
-transcript, since there is no way to attach to it.
+Past sessions are shared too. Either agent can read what the other did before:
 
-Each row is paired with the session it is most likely writing by matching process
-start time against session start time; the CLI does not hold its transcript open,
-so the pairing is inferred.
+    python3 agentsui.py sessions [DIR]       # both agents' sessions in DIR's project, newest first
+    python3 agentsui.py session <id> [DIR]   # one of them as a readable conversation
+
+These use the same transcript parsers as the board and read the files directly,
+so the server doesn't need to be running. Claude terminals opened here are told
+about the commands with `--append-system-prompt`, and Codex terminals through
+the same `developer_instructions` as the memory note.
+
+All of this only applies to terminals launched from AgentsUI. Agents in your own
+terminal windows don't know about the memory folder or the commands.
+
+## Live processes
+
+Live `claude`/`codex` processes (from `ps`) are a different set from the
+**sessions** on the board - the board includes dormant transcripts, `ps` only
+what is running right now. Each process is paired with the session it is most
+likely writing by matching process start time against session start time (the
+CLI does not hold its transcript open, so the pairing is inferred), and that
+card shows its tty and pid.
+
+## Clusters
+
+If you use Slurm clusters, each one you list gets a toolbar button showing its
+free GPUs and how many of your jobs are running and queued. Click it for a dock
+panel with the full output of the GPU and job commands, colours and all. They
+refresh every 20 minutes on their own, or now with `refresh`.
+
+List them in `~/.claude/agentsui-clusters.json` (or the file named by
+`AGENTSUI_CLUSTERS`):
+
+    [{"name": "lab", "host": "login.example.edu",
+      "gpus": "~/bin/gpus --color",
+      "jobs": "squeue -u \"$USER\" -o \"%.14i %.24j %.2t %.10M %.5D %P\"",
+      "count": ["shared"]}]
+
+`gpus` and `jobs` are commands run on the host. The free counts are read from a
+`free` line of `name count` pairs in the GPU output. `count` is optional and
+limits the running / queued counts to partitions with those prefixes (a pending
+job counts if any partition it may run on matches); keep the partition column
+last and unpadded so squeue doesn't cut it short.
+
+Login hosts often want a password and 2FA, so AgentsUI never logs in itself.
+It looks for the ssh ControlMaster your own `ssh <host>` opened
+(`ssh -O check`) and runs the commands through it with `BatchMode=yes`; no
+master, no button. With `ControlMaster auto` and `ControlPersist 3d` in
+`~/.ssh/config` the master outlives the shell you typed `ssh` in, so the panel
+stays up until it expires. A failed fetch keeps the last good output, says why,
+and retries a minute later.
 
 ## Layout
 
     agentsui.py        transcript scanning, process discovery, HTTP + JSON API
     term.py         pty spawning and a minimal WebSocket implementation
+    cluster.py      Slurm GPU / job listings over an existing ssh master
     ui.html         shell and stylesheet
     app.js          state polling, board rendering, the dock
     canvas.js       pan / zoom
     cards.js        lane and card markup (pure string renderers)
     termclient.js   the multi-terminal xterm manager
+    cluster.js      cluster panel markup: ANSI colours to spans, toolbar summary
     vendor/         xterm.js 5.5.0 and the fit addon
 
 Transcripts under `~/.claude/projects` are append-only, so `agentsui.py` keeps a
@@ -117,12 +167,23 @@ half a second; refreshes are a few hundredths.
 
 ## API
 
-    GET  /api/state              sessions, subagents, terminals, hosted ptys, build stamp
+    GET  /api/state              sessions, subagents, terminals, hosted ptys, clusters, build stamp
     GET  /api/session?file=PATH  one transcript, with its message timeline
+    POST /api/terminal/new       {client, agent, cwd} or {client, file}: start a pty
+    POST /api/terminal/close     {id}: end a pty and reap its process group
+    GET  /ws/term?terminal=ID    websocket: attach to a pty from /api/terminal/new
     GET  /ws/term?file=PATH      websocket: resume that session on a pty
     GET  /ws/term?cwd=DIR        websocket: a new session in that directory
     POST /api/hide               {id, hidden}
     POST /api/unhide-all
+    POST /api/cluster/refresh    {name}: fetch that cluster's listings now
+
+The UI starts terminals with `/api/terminal/new` and then attaches by id. A
+websocket the server turns down reports only "error" to the browser - no status
+and no body - so a terminal created over the websocket alone can only fail
+mutely. Creating it over HTTP is what lets the UI say which of "no such folder",
+"unknown agent" or "that session is running AgentsUI itself" it ran into. The
+`cwd=`/`file=` websocket forms still work for other clients.
 
 `/ws/term` rejects cross-origin requests. Browsers allow cross-origin websockets,
 so without that check any page you visited could open a terminal here.

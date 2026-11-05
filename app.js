@@ -6,7 +6,8 @@
   const layer = $("layer"), stage = $("stage"), dock = $("dock"), host = $("termHost");
 
   let state = null, showHidden = false, showStale = false, selected = null, tab = "term", stamp = null;
-  let boardSig = "", railSig = "", logMtime = 0;
+  let boardSig = "", clusterSig = "", clusterBtnSig = "", logMtime = 0;
+  let clusterName = null;   // which cluster the panel shows, while it is open
 
   // ---- board -------------------------------------------------------------
 
@@ -64,6 +65,14 @@
       if (id === selected) note(ended ? "Terminal ended." : "Disconnected — click the card to reconnect.", "");
       poll();
     },
+    // The pty never started, so the card stays: the message says why, and
+    // clicking it tries again once the reason is dealt with.
+    onFail(id, message) {
+      renderTabs();
+      if (state) renderBoard(state);
+      if (id === selected) note(message + " Click the card to try again.", "bad");
+      poll();
+    },
   };
 
   function note(text, cls) {
@@ -79,7 +88,7 @@
   function openForm(dir) {
     selected = null;
     dock.classList.add("open");
-    host.hidden = true; $("log").hidden = true;
+    host.hidden = true; $("log").hidden = true; $("cluster").hidden = true;
     note("", "");
     const form = $("newForm");
     form.hidden = false;
@@ -92,9 +101,11 @@
   }
 
   function newHint() {
-    $("newHint").textContent = $("newAgent").value === "shell"
+    const open = state && state.hosted ? state.hosted.length : 0;
+    const room = open ? " " + open + (open === 1 ? " terminal" : " terminals") + " running." : "";
+    $("newHint").textContent = ($("newAgent").value === "shell"
       ? "Runs a plain login shell on a pty in that folder - ssh in, run anything by hand. It appears on the board immediately."
-      : "Runs the real CLI on a pty in that folder. The terminal appears on the board immediately and survives page reloads.";
+      : "Runs the real CLI on a pty in that folder. The terminal appears on the board immediately and survives page reloads.") + room;
   }
 
   function startDraft(agent, dir) {
@@ -137,6 +148,7 @@
     const r = row(selected);
     host.hidden = tab !== "term";
     $("log").hidden = tab !== "log";
+    $("cluster").hidden = true;
     if (!r) return;
     if (tab === "term") {
       const lock = r.newIn ? "" : lockedReason(r.id);
@@ -170,7 +182,7 @@
     const chip = (id, label, on, closable) => {
       const r = row(id);
       const st = r ? AgentsCards.statusOf(r) : { cls: "s-idle" };
-      const hue = r ? AgentsCards.hueFor(r.project || r.cwd) : "#BDB2FF";
+      const hue = r ? AgentsCards.hueFor(r.project || r.cwd) : "#C4A7FF";
       return '<button class="chip ' + st.cls + (on ? " on" : "") + '" data-open="' + AgentsCards.esc(id) +
         '" style="--hue:' + hue + '" title="' + AgentsCards.esc(label) + '">' +
         '<span class="pip"></span><span class="t">' + AgentsCards.esc(label) + "</span>" +
@@ -193,6 +205,11 @@
     if (cur && cur.file) {
       html += '<button class="chip chip-log' + (tab === "log" ? " on" : "") + '" data-log="1">Transcript</button>';
     }
+    for (const c of (state && state.clusters) || []) {
+      if (!c.connected) continue;
+      html += '<button class="chip' + (clusterShown(c.name) ? " on" : "") + '" data-cluster="' + AgentsCards.esc(c.name) +
+        '" style="--hue:#9BC7FF"><span class="t">' + AgentsCards.esc(c.name) + "</span></button>";
+    }
     html += '<button class="chip chip-plus' + (!$("newForm").hidden ? " on" : "") + '" data-new="" title="Start a new terminal">+</button>';
     $("tabs").innerHTML = html + '<button class="dock-close" id="dockClose" aria-label="Close panel">&times;</button>';
   }
@@ -204,7 +221,8 @@
     if (!d || !row(selected) || row(selected).file !== file) return;
     logMtime = d.mtime || 0;
     const keep = log.scrollTop;
-    const html = (d.timeline || []).slice().reverse().map((t) => {
+    const followLatest = !refresh || log.scrollHeight - log.clientHeight - keep <= 48;
+    const html = (d.timeline || []).map((t) => {
       if (t.role === "tool") {
         return '<div class="turn tool"><span class="tool-name">' + AgentsCards.esc(t.body) +
           '</span><span class="tool-arg">' + AgentsCards.esc(t.detail) + "</span></div>";
@@ -215,54 +233,19 @@
     if (log.dataset.html !== html) {
       log.dataset.html = html;
       log.innerHTML = html;
-      log.scrollTop = refresh ? keep : 0;
+      log.scrollTop = followLatest ? log.scrollHeight : keep;
     }
   }
 
   function closePanel() {
     dock.classList.remove("open");
+    $("cluster").hidden = true;
     selected = null;
     try { sessionStorage.removeItem("agentsui.selected"); } catch (_) {}
     if (state) renderBoard(state);
   }
 
-  // ---- rail / tally --------------------------------------------------------
-
-  function renderRail(terms) {
-    const rail = $("rail");
-    $("railHead").innerHTML = '<b>Live processes</b>' + terms.length +
-      " running &middot; " + (state ? state.sessions.filter((r) => !r.stale).length : 0) + " sessions this week";
-    if (!terms.length) {
-      const html = '<p class="rail-empty">No agent terminals running.</p>';
-      if (html !== railSig) { railSig = html; rail.innerHTML = html; }
-      return;
-    }
-    // Terminals this app spawned look identical to real windows in `ps`,
-    // so they get their own group rather than sitting among them.
-    const mine = terms.filter((t) => t.hosted);
-    const theirs = terms.filter((t) => !t.hosted);
-    const group = (label, list) => !list.length ? "" :
-      '<div class="rail-group">' + label + "</div>" + list.map(termRow).join("");
-    const html = group("your terminal windows", theirs) + group("opened here", mine);
-    if (html === railSig) return;
-    railSig = html;
-    rail.innerHTML = html;
-  }
-
-  function termRow(t) {
-    const band = t.streaming ? "live" : (t.age != null && t.age < 3600 ? "warm" : "");
-    const hue = AgentsCards.hueFor(t.project || t.cwd);
-    return '<button class="term" data-sess="' + AgentsCards.esc(t.session || "") +
-      '" data-hosted="' + (t.hosted ? 1 : 0) + '" style="--hue:' + hue + '">' +
-      '<div class="term-top"><span class="dot ' + band + '"></span>' +
-      '<span class="term-tty">' + AgentsCards.esc(t.tty) + "</span>" +
-      '<span class="term-agent">' + (t.agent || "claude") + "</span>" +
-      '<span class="term-pid">' + t.pid + "</span></div>" +
-      '<div class="term-proj">' + AgentsCards.esc(t.project || t.cwd || "?") +
-      (t.hosted ? '<span class="tag">here</span>' : "") + "</div>" +
-      '<div class="term-what">' + AgentsCards.esc(t.title || "up " + AgentsCards.ago(t.uptime)) +
-      "</div></button>";
-  }
+  // ---- tally -------------------------------------------------------------
 
   function renderTally(s) {
     const working = s.sessions.filter((r) => r.status === "working").length;
@@ -289,6 +272,48 @@
     older.classList.toggle("on", showStale);
   }
 
+  // ---- clusters: free GPUs and your jobs, while an ssh master to each is up ---
+
+  const clusterOf = (name) => ((state && state.clusters) || []).find((c) => c.name === name) || null;
+  const clusterShown = (name) => clusterName === name && !$("cluster").hidden && dock.classList.contains("open");
+
+  function renderClusters(list) {
+    const btns = (list || []).filter((c) => c.connected).map((c) =>
+      '<button class="tbtn tbtn-cluster' + (clusterShown(c.name) ? " on" : "") + '" type="button" data-cluster="' +
+      AgentsCards.esc(c.name) + '"' + (c.count.length ? ' title="running and queued: your jobs on ' +
+      AgentsCards.esc(c.count.join(" / ")) + ' partitions"' : "") + ">" + AgentsCluster.button(c) + "</button>").join("");
+    if (btns !== clusterBtnSig) { clusterBtnSig = btns; $("clusterBtns").innerHTML = btns; }
+    const k = clusterOf(clusterName);
+    if ($("cluster").hidden || !k) return;
+    $("clusterHead").innerHTML = AgentsCluster.head(k, Date.now() / 1000);
+    const html = AgentsCluster.body(k);
+    if (html !== clusterSig) { clusterSig = html; $("clusterBody").innerHTML = html; }   // keeps a text selection alive
+  }
+
+  function openCluster(name) {
+    clusterName = name;
+    selected = null;
+    try { sessionStorage.removeItem("agentsui.selected"); } catch (_) {}
+    dock.classList.add("open");
+    dock.style.setProperty("--hue", "#9BC7FF");
+    $("newForm").hidden = true; host.hidden = true; $("log").hidden = true;
+    $("cluster").hidden = false;
+    clusterSig = "";
+    note("", "");
+    renderClusters(state && state.clusters);
+    renderTabs();
+    if (state) renderBoard(state);
+  }
+
+  async function refreshCluster() {
+    const k = clusterOf(clusterName);
+    if (!k) return;
+    k.fetching = true;
+    renderClusters(state.clusters);
+    await post("/api/cluster/refresh", { name: k.name });
+    poll();
+  }
+
   // ---- plumbing ----------------------------------------------------------
 
   const post = (path, body) => fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) }).catch(() => {});
@@ -303,10 +328,10 @@
     }
     $("host").textContent = s.host;
     renderTally(s);
-    renderRail(s.terminals);
+    renderClusters(s.clusters);
     renderBoard(s);
     if (selected && !row(selected)) closePanel();
-    if (selected || s.hosted.length) renderTabs();
+    if (selected || s.hosted.length || !$("cluster").hidden) renderTabs();
     if (!restoredPanel) {
       restoredPanel = true;
       let previous;
@@ -413,6 +438,8 @@
       } catch (_) { note("Could not end terminal. Try again.", "bad"); }
       return;
     }
+    const cl = ev.target.closest("[data-cluster]");
+    if (cl) { openCluster(cl.dataset.cluster); return; }
     const open = ev.target.closest("[data-open]");
     if (open) return openPanel(open.dataset.open, "term");
     if (ev.target.closest("[data-log]")) { if (selected) openPanel(selected, "log"); return; }
@@ -457,11 +484,6 @@
     });
   })();
 
-  $("rail").addEventListener("click", (ev) => {
-    const btn = ev.target.closest("[data-sess]");
-    if (btn && btn.dataset.sess) openPanel(btn.dataset.sess, btn.dataset.hosted === "1" ? "term" : "log");
-  });
-
   addEventListener("keydown", (ev) => {
     if (ev.key !== "Escape") return;
     if (document.activeElement && document.activeElement.closest(".term-host")) return;
@@ -469,6 +491,11 @@
   });
 
   $("newTerm").onclick = () => openForm();
+  $("clusterBtns").addEventListener("click", (ev) => {
+    const b = ev.target.closest("[data-cluster]");
+    if (b) clusterShown(b.dataset.cluster) ? closePanel() : openCluster(b.dataset.cluster);
+  });
+  $("clusterHead").addEventListener("click", (ev) => { if (ev.target.closest("[data-refresh]")) refreshCluster(); });
   $("newAgent").onchange = newHint;
   $("newForm").addEventListener("submit", (ev) => {
     ev.preventDefault();
